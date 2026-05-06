@@ -1,0 +1,8 @@
+notebook
+numpy
+pandas
+pyarrow
+scikit-learn
+torch
+tqdm
+tensorboard

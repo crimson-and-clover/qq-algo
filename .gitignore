@@ -1,0 +1,17 @@
+/.venv/
+/**/__pycache__/
+/**/.DS_Store
+/.DS_Store
+/**/*.parquet
+/**/*.log
+/**/*.png
+/**/*.jpg
+/**/*.jpeg
+/**/*.gif
+/**/*.bmp
+/**/*.svg
+/**/*.ico
+/**/*.pdf
+/**/*.doc
+/**/*.docx
+/**/*.xls
