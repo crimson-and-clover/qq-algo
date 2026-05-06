@@ -400,8 +400,12 @@ class PCVRHyFormerRankingTrainer:
                     self.writer.add_scalar('LR/dense', self.dense_optimizer.param_groups[0]['lr'], total_step)
                     if 'bce' in loss_dict:
                         self.writer.add_scalar('Loss/bce', loss_dict['bce'], total_step)
+                    if 'focal' in loss_dict:
+                        self.writer.add_scalar('Loss/focal', loss_dict['focal'], total_step)
                     if 'rank' in loss_dict:
                         self.writer.add_scalar('Loss/rank', loss_dict['rank'], total_step)
+                    if 'info' in loss_dict:
+                        self.writer.add_scalar('Loss/info', loss_dict['info'], total_step)
 
                 postfix = {
                     "loss": f"{loss:.4f}",
@@ -409,8 +413,12 @@ class PCVRHyFormerRankingTrainer:
                 }
                 if 'bce' in loss_dict:
                     postfix['bce'] = f"{loss_dict['bce']:.4f}"
+                if 'focal' in loss_dict:
+                    postfix['focal'] = f"{loss_dict['focal']:.4f}"
                 if 'rank' in loss_dict:
                     postfix['rank'] = f"{loss_dict['rank']:.4f}"
+                if 'info' in loss_dict:
+                    postfix['info'] = f"{loss_dict['info']:.4f}"
                 train_pbar.set_postfix(postfix)
 
                 # Step-level validation (only when eval_every_n_steps > 0).
