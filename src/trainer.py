@@ -396,63 +396,82 @@ class PCVRHyFormerRankingTrainer:
                     self.dense_scheduler.step()
 
                 if self.writer:
-                    self.writer.add_scalar('Loss/train', loss, total_step)
-                    self.writer.add_scalar('LR/dense', self.dense_optimizer.param_groups[0]['lr'], total_step)
+                    self.writer.add_scalar('Loss/Total', loss, total_step)
+                    self.writer.add_scalar('LR/Dense', self.dense_optimizer.param_groups[0]['lr'], total_step)
+                    if self.sparse_optimizer is not None:
+                        self.writer.add_scalar('LR/Sparse', self.sparse_optimizer.param_groups[0]['lr'], total_step)
                     if 'bce' in loss_dict:
-                        self.writer.add_scalar('Loss/bce', loss_dict['bce'], total_step)
+                        self.writer.add_scalar('Loss/BCEWithLogitsLoss', loss_dict['bce'], total_step)
                     if 'focal' in loss_dict:
-                        self.writer.add_scalar('Loss/focal', loss_dict['focal'], total_step)
+                        self.writer.add_scalar('Loss/FocalLoss', loss_dict['focal'], total_step)
                     if 'rank' in loss_dict:
-                        self.writer.add_scalar('Loss/rank', loss_dict['rank'], total_step)
+                        self.writer.add_scalar('Loss/PairwiseHingeLoss', loss_dict['rank'], total_step)
                     if 'info' in loss_dict:
-                        self.writer.add_scalar('Loss/info', loss_dict['info'], total_step)
+                        self.writer.add_scalar('Loss/InfoNCELoss', loss_dict['info'], total_step)
+                    if 'dense_grad_norm' in loss_dict:
+                        self.writer.add_scalar('GradNorm/Dense', loss_dict['dense_grad_norm'], total_step)
+                    if 'sparse_grad_norm' in loss_dict:
+                        self.writer.add_scalar('GradNorm/Sparse', loss_dict['sparse_grad_norm'], total_step)
 
                 postfix = {
                     "loss": f"{loss:.4f}",
                     "lr": f"{self.dense_optimizer.param_groups[0]['lr']:.2e}",
                 }
                 if 'bce' in loss_dict:
-                    postfix['bce'] = f"{loss_dict['bce']:.4f}"
+                    postfix['BCE'] = f"{loss_dict['bce']:.4f}"
                 if 'focal' in loss_dict:
-                    postfix['focal'] = f"{loss_dict['focal']:.4f}"
+                    postfix['Focal'] = f"{loss_dict['focal']:.4f}"
                 if 'rank' in loss_dict:
-                    postfix['rank'] = f"{loss_dict['rank']:.4f}"
+                    postfix['Hinge'] = f"{loss_dict['rank']:.4f}"
                 if 'info' in loss_dict:
-                    postfix['info'] = f"{loss_dict['info']:.4f}"
+                    postfix['InfoNCE'] = f"{loss_dict['info']:.4f}"
                 train_pbar.set_postfix(postfix)
 
                 # Step-level validation (only when eval_every_n_steps > 0).
                 if self.eval_every_n_steps > 0 and total_step % self.eval_every_n_steps == 0:
                     logging.info(f"Evaluating at step {total_step}")
-                    val_auc, val_logloss = self.evaluate(epoch=epoch)
+                    val_auc, val_logloss, val_calibration = self.evaluate(epoch=epoch)
                     self.model.train()
                     torch.cuda.empty_cache()
 
-                    logging.info(f"Step {total_step} Validation | AUC: {val_auc}, LogLoss: {val_logloss}")
+                    logging.info(f"Step {total_step} Validation | AUC: {val_auc}, LogLoss: {val_logloss}, Calibration: {val_calibration:.4f}")
 
                     if self.writer:
-                        self.writer.add_scalar('AUC/valid', val_auc, total_step)
-                        self.writer.add_scalar('LogLoss/valid', val_logloss, total_step)
+                        self.writer.add_scalar('AUC/Validation', val_auc, total_step)
+                        self.writer.add_scalar('LogLoss/Validation', val_logloss, total_step)
+                        self.writer.add_scalar('Calibration/Validation', val_calibration, total_step)
 
                     self._handle_validation_result(total_step, val_auc, val_logloss)
 
                     if self.early_stopping.early_stop:
                         logging.info(f"Early stopping at step {total_step}")
-                        return
+                        break
 
             logging.info(f"Epoch {epoch}, Average Loss: {loss_sum / len(self.train_loader)}")
 
-            val_auc, val_logloss = self.evaluate(epoch=epoch)
+            val_auc, val_logloss, val_calibration = self.evaluate(epoch=epoch)
             self.model.train()
             torch.cuda.empty_cache()
 
-            logging.info(f"Epoch {epoch} Validation | AUC: {val_auc}, LogLoss: {val_logloss}")
-
+            logging.info(f"Epoch {epoch} Validation | AUC: {val_auc}, LogLoss: {val_logloss}, Calibration: {val_calibration:.4f}")
             if self.writer:
-                self.writer.add_scalar('AUC/valid', val_auc, total_step)
-                self.writer.add_scalar('LogLoss/valid', val_logloss, total_step)
+                self.writer.add_scalar('AUC/Validation', val_auc, total_step)
+                self.writer.add_scalar('LogLoss/Validation', val_logloss, total_step)
+                self.writer.add_scalar('Calibration/Validation', val_calibration, total_step)
 
             self._handle_validation_result(total_step, val_auc, val_logloss)
+
+            # Log sparse embedding weight statistics once per epoch.
+            if self.writer and self.sparse_optimizer is not None:
+                emb_norm_mean = 0.0
+                emb_count = 0
+                for p in self.model.get_sparse_params():
+                    # Vector-wise L2 norm per embedding row, then average over vocab.
+                    norms = p.data.norm(p=2, dim=1)
+                    emb_norm_mean += norms.mean().item()
+                    emb_count += 1
+                if emb_count > 0:
+                    self.writer.add_scalar('Sparse/EmbeddingMeanNorm', emb_norm_mean / emb_count, total_step)
 
             if self.early_stopping.early_stop:
                 logging.info(f"Early stopping at epoch {epoch}")
@@ -571,6 +590,25 @@ class PCVRHyFormerRankingTrainer:
         loss_dict['total'] = loss
 
         loss.backward()
+
+        # Compute per-group grad norms before clipping (for TensorBoard).
+        dense_grad_norm = 0.0
+        sparse_grad_norm = 0.0
+        if hasattr(self.model, 'get_sparse_params'):
+            for p in self.model.get_dense_params():
+                if p.grad is not None:
+                    dense_grad_norm += p.grad.data.norm(2).item() ** 2
+            for p in self.model.get_sparse_params():
+                if p.grad is not None:
+                    sparse_grad_norm += p.grad.data.norm(2).item() ** 2
+            dense_grad_norm = dense_grad_norm ** 0.5
+            sparse_grad_norm = sparse_grad_norm ** 0.5
+        else:
+            for p in self.model.parameters():
+                if p.grad is not None:
+                    dense_grad_norm += p.grad.data.norm(2).item() ** 2
+            dense_grad_norm = dense_grad_norm ** 0.5
+
         # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
         # with certain tensor shapes in this project.
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
@@ -579,11 +617,14 @@ class PCVRHyFormerRankingTrainer:
         if self.sparse_optimizer is not None:
             self.sparse_optimizer.step()
 
+        loss_dict['dense_grad_norm'] = dense_grad_norm
+        loss_dict['sparse_grad_norm'] = sparse_grad_norm
+
         # Convert to Python floats for return
         return {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in loss_dict.items()}
 
-    def evaluate(self, epoch: Optional[int] = None) -> Tuple[float, float]:
-        """Run validation over ``self.valid_loader`` and return ``(AUC, logloss)``.
+    def evaluate(self, epoch: Optional[int] = None) -> Tuple[float, float, float]:
+        """Run validation over ``self.valid_loader`` and return ``(AUC, logloss, calibration)``.
 
         NaN predictions (which can arise from exploding gradients) are filtered
         out before computing both metrics.
@@ -633,7 +674,12 @@ class PCVRHyFormerRankingTrainer:
         else:
             logloss = float('inf')
 
-        return auc, logloss
+        # Calibration: mean predicted probability / mean real label.
+        mean_pred = float(probs.mean()) if len(probs) > 0 else 0.0
+        mean_label = float(labels_np.mean()) if len(labels_np) > 0 else 0.0
+        calibration = mean_pred / max(mean_label, 1e-8)
+
+        return auc, logloss, calibration
 
     def _evaluate_step(
         self, batch: Dict[str, Any]
