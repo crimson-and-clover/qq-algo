@@ -139,8 +139,8 @@ def parse_args() -> argparse.Namespace:
     # Loss function.
     parser.add_argument('--loss_type', type=str, default='bce',
                         help='Loss composition using "+" to combine atomic losses. '
-                             'Supported atoms: bce, focal, pair. '
-                             'Examples: bce, focal, bce+pair, bce+focal+pair')
+                             'Supported atoms: bce, focal, pair, info. '
+                             'Examples: bce, focal, bce+pair, bce+focal+pair, bce+info')
     parser.add_argument('--focal_alpha', type=float, default=0.75,
                         help='Focal Loss positive-class weight alpha '
                              '(effective only when focal is in loss_type). '
@@ -157,6 +157,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--rank_margin', type=float, default=1.0,
                         help='Hinge margin for pairwise ranking loss '
                              '(effective only when pair is in loss_type, default 1.0)')
+    parser.add_argument('--info_weight', type=float, default=1.0,
+                        help='Weight for InfoNCE term (default 1.0)')
+    parser.add_argument('--info_tau', type=float, default=0.07,
+                        help='Temperature for InfoNCE (default 0.07)')
 
     # Sparse optimizer.
     parser.add_argument('--sparse_lr', type=float, default=0.05,
@@ -395,6 +399,8 @@ def main() -> None:
         focal_weight=args.focal_weight,
         pair_weight=args.pair_weight,
         rank_margin=args.rank_margin,
+        info_weight=args.info_weight,
+        info_tau=args.info_tau,
         sparse_lr=args.sparse_lr,
         sparse_weight_decay=args.sparse_weight_decay,
         dense_weight_decay=args.dense_weight_decay,

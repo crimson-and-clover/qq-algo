@@ -1678,8 +1678,17 @@ class PCVRHyFormer(nn.Module):
 
         return output
 
-    def forward(self, inputs: ModelInput) -> torch.Tensor:
-        """Runs the forward pass of the PCVRHyFormer model."""
+    def forward(self, inputs: ModelInput, return_embedding: bool = False):
+        """Runs the forward pass of the PCVRHyFormer model.
+
+        Args:
+            inputs: ModelInput tuple.
+            return_embedding: If True, also return the hidden representation
+                before the classifier (used by InfoNCE / contrastive loss).
+        Returns:
+            logits: (B, action_num) when return_embedding=False.
+            (logits, emb): ((B, action_num), (B, d_model)) when return_embedding=True.
+        """
         # 1. NS tokens: grouped projection
         user_ns = self.user_ns_tokenizer(inputs.user_int_feats)   # (B, num_user_groups, D)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
@@ -1722,6 +1731,8 @@ class PCVRHyFormer(nn.Module):
 
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
+        if return_embedding:
+            return logits, output
         return logits
 
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:

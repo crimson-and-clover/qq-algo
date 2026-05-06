@@ -9,7 +9,7 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 #     "$@"
 
 # ---- Mode: training (default) ----
-# Active config: RankMixer NS tokenizer + bce+pair loss (no ns_groups.json required)
+# Active config: RankMixer NS tokenizer + BCE + InfoNCE (no ns_groups.json required)
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
     --user_ns_tokens 5 \
@@ -20,13 +20,30 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --num_workers 8 \
     --use_target_attention \
     --no_scheduler \
-    --loss_type bce+pair \
-    --bce_weight 0.5 \
-    --pair_weight 0.5 \
-    --rank_margin 1.0 \
+    --loss_type bce+info \
+    --bce_weight 1.0 \
+    --info_weight 0.5 \
+    --info_tau 0.07 \
     "$@"
 
-# ---- Legacy config: BCE loss (baseline) ----
+# ---- Legacy config: BCE + Pairwise Hinge ----
+# python3 -u "${SCRIPT_DIR}/train.py" \
+#     --ns_tokenizer_type rankmixer \
+#     --user_ns_tokens 5 \
+#     --item_ns_tokens 2 \
+#     --num_queries 2 \
+#     --ns_groups_json "" \
+#     --emb_skip_threshold 1000000 \
+#     --num_workers 8 \
+#     --use_target_attention \
+#     --no_scheduler \
+#     --loss_type bce+pair \
+#     --bce_weight 0.5 \
+#     --pair_weight 0.5 \
+#     --rank_margin 1.0 \
+#     "$@"
+
+# ---- Baseline config: BCE only ----
 # python3 -u "${SCRIPT_DIR}/train.py" \
 #     --ns_tokenizer_type rankmixer \
 #     --user_ns_tokens 5 \

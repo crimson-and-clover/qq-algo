@@ -286,3 +286,39 @@ def sigmoid_focal_loss(
     elif reduction == 'sum':
         return loss.sum()
     return loss
+
+
+def supervised_infonce(
+    emb: torch.Tensor,
+    labels: torch.Tensor,
+    tau: float = 0.07,
+) -> torch.Tensor:
+    """Supervised InfoNCE: same-label pairs are positives, cross-label are negatives.
+
+    Args:
+        emb: (B, D) hidden representations.
+        labels: (B,) binary labels {0, 1}.
+        tau: temperature coefficient.
+    Returns:
+        scalar loss tensor.
+    """
+    B = emb.shape[0]
+    # L2 normalize so that dot product equals cosine similarity
+    emb = F.normalize(emb, p=2, dim=1)
+    # (B, B) similarity matrix scaled by temperature
+    sim = torch.matmul(emb, emb.t()) / tau
+    # Mask out self-similarity
+    sim = sim.masked_fill(torch.eye(B, device=emb.device).bool(), -1e9)
+
+    # Positive mask: same label, excluding diagonal
+    pos_mask = (labels.unsqueeze(1) == labels.unsqueeze(0)).float()
+    pos_mask = pos_mask - torch.eye(B, device=emb.device)
+
+    exp_sim = torch.exp(sim)
+    numerator = (exp_sim * pos_mask).sum(dim=1)
+    denominator = exp_sim.sum(dim=1)
+
+    has_pos = pos_mask.sum(dim=1) > 0
+    if has_pos.sum() == 0:
+        return torch.tensor(0.0, device=emb.device)
+    return -torch.log(numerator[has_pos] / denominator[has_pos] + 1e-8).mean()

@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
 
-from utils import sigmoid_focal_loss, EarlyStopping
+from utils import sigmoid_focal_loss, supervised_infonce, EarlyStopping
 from model import ModelInput
 
 
@@ -52,6 +52,8 @@ class PCVRHyFormerRankingTrainer:
         bce_weight: float = 1.0,
         focal_weight: float = 1.0,
         pair_weight: float = 0.5,
+        info_weight: float = 1.0,
+        info_tau: float = 0.07,
         rank_margin: float = 1.0,
         sparse_lr: float = 0.05,
         sparse_weight_decay: float = 0.0,
@@ -115,12 +117,14 @@ class PCVRHyFormerRankingTrainer:
         self.bce_weight: float = bce_weight
         self.focal_weight: float = focal_weight
         self.pair_weight: float = pair_weight
+        self.info_weight: float = info_weight
+        self.info_tau: float = info_tau
         self.rank_margin: float = rank_margin
         self.reinit_sparse_after_epoch: int = reinit_sparse_after_epoch
 
         # Parse composite loss_type, e.g. "bce+pair", "bce+focal+pair"
         self.parsed_losses: Set[str] = set(loss_type.split('+')) - {''}
-        valid_atoms = {'bce', 'focal', 'pair'}
+        valid_atoms = {'bce', 'focal', 'pair', 'info'}
         invalid = self.parsed_losses - valid_atoms
         if invalid:
             raise ValueError(
@@ -160,7 +164,8 @@ class PCVRHyFormerRankingTrainer:
                          f"parsed_losses={self.parsed_losses}, "
                          f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                          f"bce_weight={bce_weight}, focal_weight={focal_weight}, "
-                         f"pair_weight={pair_weight}, rank_margin={rank_margin}, "
+                         f"pair_weight={pair_weight}, info_weight={info_weight}, "
+                         f"info_tau={info_tau}, rank_margin={rank_margin}, "
                          f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
                          f"dense_scheduler=warmup({warmup_epochs}ep)+cosine({cosine_t_max_epochs}ep), "
                          f"warmup_steps={warmup_steps}/{total_steps}, "
@@ -176,7 +181,8 @@ class PCVRHyFormerRankingTrainer:
                          f"parsed_losses={self.parsed_losses}, "
                          f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                          f"bce_weight={bce_weight}, focal_weight={focal_weight}, "
-                         f"pair_weight={pair_weight}, rank_margin={rank_margin}, "
+                         f"pair_weight={pair_weight}, info_weight={info_weight}, "
+                         f"info_tau={info_tau}, rank_margin={rank_margin}, "
                          f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
                          f"dense_scheduler=disabled, "
                          f"scheduler_dense_only={scheduler_dense_only}")
@@ -511,7 +517,12 @@ class PCVRHyFormerRankingTrainer:
             self.sparse_optimizer.zero_grad()
 
         model_input = self._make_model_input(device_batch)
-        logits = self.model(model_input)  # (B, 1)
+
+        # InfoNCE needs the hidden embedding before the classifier.
+        if 'info' in self.parsed_losses:
+            logits, emb = self.model(model_input, return_embedding=True)  # (B, 1), (B, D)
+        else:
+            logits = self.model(model_input)  # (B, 1)
         logits = logits.squeeze(-1)  # (B,)
 
         loss = torch.tensor(0.0, device=logits.device)
@@ -543,6 +554,11 @@ class PCVRHyFormerRankingTrainer:
                 rank_loss = torch.tensor(0.0, device=logits.device)
             loss = loss + self.pair_weight * rank_loss
             loss_dict['rank'] = rank_loss
+
+        if 'info' in self.parsed_losses:
+            info_loss = supervised_infonce(emb, label, tau=self.info_tau)
+            loss = loss + self.info_weight * info_loss
+            loss_dict['info'] = info_loss
 
         loss_dict['total'] = loss
 
