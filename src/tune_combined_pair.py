@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tune bce_weight for combined_pair loss on local demo data.
+"""Tune bce_weight for bce+pair loss on local demo data.
 
 Runs short training sessions (few epochs, tight patience) for each candidate
 bce_weight and reports the best validation AUC.  Designed to run standalone
@@ -78,8 +78,9 @@ def run_one(bce_weight: float, out_dir: Path) -> Tuple[float, str, str]:
         "--emb_skip_threshold", "1000000",
         "--seq_id_threshold", "10000",
         "--use_target_attention",
-        "--loss_type", "combined_pair",
+        "--loss_type", "bce+pair",
         "--bce_weight", str(bce_weight),
+        "--pair_weight", str(1.0 - bce_weight),
         "--rank_margin", str(RANK_MARGIN),
         "--num_epochs", str(NUM_EPOCHS),
         "--patience", str(PATIENCE),
@@ -111,7 +112,7 @@ def run_one(bce_weight: float, out_dir: Path) -> Tuple[float, str, str]:
 
 def main() -> None:
     results: List[Tuple[float, float]] = []
-    base_tmp = Path(tempfile.gettempdir()) / "pcvr_tune_combined_pair"
+    base_tmp = Path(tempfile.gettempdir()) / "pcvr_tune_bce_pair"
 
     for w in BCE_WEIGHTS:
         print(f"\n{'='*60}")

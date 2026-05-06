@@ -138,22 +138,25 @@ def parse_args() -> argparse.Namespace:
 
     # Loss function.
     parser.add_argument('--loss_type', type=str, default='bce',
-                        choices=['bce', 'focal', 'combined_pair'],
-                        help='Loss type: bce = BCEWithLogits, focal = Focal Loss, '
-                             'combined_pair = BCE + pairwise hinge ranking loss')
+                        help='Loss composition using "+" to combine atomic losses. '
+                             'Supported atoms: bce, focal, pair. '
+                             'Examples: bce, focal, bce+pair, bce+focal+pair')
     parser.add_argument('--focal_alpha', type=float, default=0.75,
                         help='Focal Loss positive-class weight alpha '
-                             '(effective only when --loss_type=focal). '
+                             '(effective only when focal is in loss_type). '
                              'Default 0.75 compensates for extreme CVR imbalance.')
     parser.add_argument('--focal_gamma', type=float, default=2.0,
                         help='Focal Loss focusing parameter gamma '
-                             '(effective only when --loss_type=focal)')
-    parser.add_argument('--bce_weight', type=float, default=0.7,
-                        help='Weight for BCE term in combined_pair loss '
-                             '(default 0.7). Ranking term weight = 1 - bce_weight.')
+                             '(effective only when focal is in loss_type)')
+    parser.add_argument('--bce_weight', type=float, default=1.0,
+                        help='Weight for BCE term (default 1.0)')
+    parser.add_argument('--focal_weight', type=float, default=1.0,
+                        help='Weight for Focal Loss term (default 1.0)')
+    parser.add_argument('--pair_weight', type=float, default=0.5,
+                        help='Weight for pairwise hinge ranking loss term (default 0.5)')
     parser.add_argument('--rank_margin', type=float, default=1.0,
                         help='Hinge margin for pairwise ranking loss '
-                             'in combined_pair (default 1.0)')
+                             '(effective only when pair is in loss_type, default 1.0)')
 
     # Sparse optimizer.
     parser.add_argument('--sparse_lr', type=float, default=0.05,
@@ -389,6 +392,8 @@ def main() -> None:
         focal_alpha=args.focal_alpha,
         focal_gamma=args.focal_gamma,
         bce_weight=args.bce_weight,
+        focal_weight=args.focal_weight,
+        pair_weight=args.pair_weight,
         rank_margin=args.rank_margin,
         sparse_lr=args.sparse_lr,
         sparse_weight_decay=args.sparse_weight_decay,

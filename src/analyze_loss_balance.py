@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Diagnose BCE vs Ranking loss balance for combined_pair.
+"""Diagnose BCE vs Ranking loss balance for bce+pair.
 
 Runs a few batches through the model and reports:
 1. Raw loss magnitudes (bce_loss, rank_loss)

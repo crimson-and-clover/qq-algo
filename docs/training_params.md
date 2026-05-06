@@ -42,9 +42,13 @@
 | `--patience` | 5 | 早停耐心值（验证无提升次数） |
 | `--seed` | 42 | 随机种子 |
 | `--device` | cuda | 训练设备 |
-| `--loss_type` | bce | 损失函数：BCEWithLogitsLoss |
-| `--focal_alpha` | 0.1 | Focal Loss alpha（仅 loss_type=focal 生效） |
-| `--focal_gamma` | 2.0 | Focal Loss gamma（仅 loss_type=focal 生效） |
+| `--loss_type` | bce | 损失函数组合，用 `+` 连接原子 loss：`bce`、`focal`、`pair`。例：`bce+pair` |
+| `--bce_weight` | 1.0 | BCE 项权重 |
+| `--focal_weight` | 1.0 | Focal 项权重（`focal` 在 loss_type 中时生效） |
+| `--pair_weight` | 0.5 | Pairwise Hinge 项权重（`pair` 在 loss_type 中时生效） |
+| `--focal_alpha` | 0.75 | Focal Loss alpha（`focal` 在 loss_type 中时生效） |
+| `--focal_gamma` | 2.0 | Focal Loss gamma（`focal` 在 loss_type 中时生效） |
+| `--rank_margin` | 1.0 | Pairwise Hinge margin（`pair` 在 loss_type 中时生效） |
 | `--eval_every_n_steps` | 0 | 每 N 步验证（0=每 epoch 结束验证） |
 | `--reinit_sparse_after_epoch` | 1 | 从第 1 个 epoch 起，每 epoch 结束重建高基数 Embedding |
 | `--reinit_cardinality_threshold` | 0 | 重建阈值（0=不重建任何 Embedding） |

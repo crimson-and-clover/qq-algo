@@ -9,7 +9,7 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 #     "$@"
 
 # ---- Mode: training (default) ----
-# Active config: RankMixer NS tokenizer + combined_pair loss (no ns_groups.json required)
+# Active config: RankMixer NS tokenizer + bce+pair loss (no ns_groups.json required)
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
     --user_ns_tokens 5 \
@@ -20,8 +20,9 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --num_workers 8 \
     --use_target_attention \
     --no_scheduler \
-    --loss_type combined_pair \
+    --loss_type bce+pair \
     --bce_weight 0.5 \
+    --pair_weight 0.5 \
     --rank_margin 1.0 \
     "$@"
 

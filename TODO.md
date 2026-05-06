@@ -81,7 +81,7 @@ $$
 其中 $p_t = p$ 当 $y=1$，否则 $p_t = 1-p$；$\alpha$ 控制正负样本权重，$\gamma$ 控制对易分样本的抑制程度。
 
 **当前默认参数：**
-- `--loss_type=bce`（默认）/ `--loss_type=focal`（显式开启）
+- `--loss_type=bce`（默认）/ `--loss_type=focal` / `--loss_type=bce+pair`（显式开启）
 - `--focal_alpha=0.75`：正样本权重（$y=1$ 时 $\alpha_t=0.75$，$y=0$ 时 $\alpha_t=0.25$）
 - `--focal_gamma=2.0`：标准值，$\gamma=0$ 退化为 BCE
 
@@ -104,7 +104,7 @@ $$
 
 **公式：**
 $$
-\mathcal{L} = \lambda \cdot \mathcal{L}_{\text{BCE}} + (1-\lambda) \cdot \underbrace{\frac{1}{N^{+} N^{-}} \sum_{i \in \mathcal{P}} \sum_{j \in \mathcal{N}} \max(0, m - (z_i - z_j))}_{\text{pairwise hinge ranking loss}}
+\mathcal{L} = w_{\text{BCE}} \cdot \mathcal{L}_{\text{BCE}} + w_{\text{rank}} \cdot \underbrace{\frac{1}{N^{+} N^{-}} \sum_{i \in \mathcal{P}} \sum_{j \in \mathcal{N}} \max(0, m - (z_i - z_j))}_{\text{pairwise hinge ranking loss}}
 $$
 
 **为什么适合本项目：**
@@ -114,13 +114,14 @@ $$
 4. **缓解梯度消失**：ranking loss 负样本梯度 = 1（当 $z_i - z_j < m$ 时），远大于 BCE 的 `~CTR`
 
 **建议超参：**
-- `bce_weight` ($\lambda$)：0.6 ~ 0.8（论文 sweet spot = 0.7）
+- `bce_weight`：0.5 ~ 1.0（与 `pair_weight` 独立调节）
+- `pair_weight`：0.3 ~ 0.7（论文 sweet spot 等价于 bce:pair ≈ 0.7:0.3 ~ 0.5:0.5）
 - `rank_margin`：1.0（标准 hinge margin）
 - `batch_size`：≥ 256（需保证 batch 内正负共存，否则 ranking loss = 0）
 
 **接入成本**：低（~30 行代码，纯 tensor 运算）
 
-**实现位置**：`src/trainer.py::_train_step()` 中增加 `--loss_type=combined_pair` 分支
+**实现位置**：`src/trainer.py::_train_step()` 中通过 `parsed_losses` set 累加各 loss 项
 
 ---
 

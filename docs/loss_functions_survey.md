@@ -13,6 +13,7 @@
 |------|------|----------|
 | BCE (`binary_cross_entropy_with_logits`) | ✅ 已内置 | `--loss_type=bce` (默认) |
 | Focal Loss | ✅ 已内置 | `--loss_type=focal --focal_alpha=0.75 --focal_gamma=2.0` |
+| BCE + Pairwise Hinge | ✅ 已内置 | `--loss_type=bce+pair --bce_weight=0.5 --pair_weight=0.5` |
 
 训练代码位置：`src/trainer.py::_train_step()`
 Loss 实现位置：`src/utils.py::sigmoid_focal_loss()`
@@ -80,7 +81,7 @@ $$\mathcal{L}_{\text{rank}} = \frac{1}{N^{+} N^{-}} \sum_{i \in \mathcal{P}} \su
 
 **Combined-Pair**（BCE + ranking）：
 
-$$\mathcal{L} = \lambda \cdot \mathcal{L}_{\text{BCE}} + (1-\lambda) \cdot \mathcal{L}_{\text{rank}}$$
+$$\mathcal{L} = w_{\text{BCE}} \cdot \mathcal{L}_{\text{BCE}} + w_{\text{rank}} \cdot \mathcal{L}_{\text{rank}}$$
 
 - **优点**：
   - 负样本 ranking loss 梯度 = 1（当 $z_i - z_j < m$ 时），远大于 BCE 的 `~CTR`
@@ -168,53 +169,30 @@ $$\mathcal{L}_{\text{contrast}} = -\frac{1}{N} \sum_{i=1}^{N} \frac{1}{|P(i)|} \
 
 ---
 
-## 5. Combined-Pair 实现草案（供参考）
+## 5. Composite Loss 实现（供参考）
+
+`trainer.py::_train_step()` 中通过 `parsed_losses` set 累加各 loss 项：
 
 ```python
-def combined_pair_loss(logits: torch.Tensor, labels: torch.Tensor,
-                       bce_weight: float = 0.7, margin: float = 1.0) -> torch.Tensor:
-    """Combined-Pair: BCE + pairwise hinge ranking loss.
+loss = torch.tensor(0.0, device=logits.device)
 
-    Args:
-        logits: (B,) raw logits.
-        labels: (B,) binary labels {0, 1}.
-        bce_weight: weight for BCE term (lambda in paper).
-        margin: hinge margin.
-    """
-    # 1. BCE term
-    bce = F.binary_cross_entropy_with_logits(logits, labels)
+if 'bce' in self.parsed_losses:
+    bce_loss = F.binary_cross_entropy_with_logits(logits, label)
+    loss = loss + self.bce_weight * bce_loss
 
-    # 2. Pairwise ranking term (hinge)
-    # 在一个 batch 内构造所有 (正, 负) pairs
-    pos_mask = labels == 1
-    neg_mask = labels == 0
+if 'focal' in self.parsed_losses:
+    focal_loss = sigmoid_focal_loss(logits, label, alpha=..., gamma=...)
+    loss = loss + self.focal_weight * focal_loss
 
-    if pos_mask.sum() == 0 or neg_mask.sum() == 0:
-        # batch 内没有正负样本对，只回传 BCE
-        return bce
-
-    pos_logits = logits[pos_mask]   # (N+,)
-    neg_logits = logits[neg_mask]   # (N-,)
-
-    # 广播构造差值矩阵: (N+, 1) - (1, N-) -> (N+, N-)
-    diff = pos_logits.unsqueeze(1) - neg_logits.unsqueeze(0)
-
-    # hinge: max(0, margin - diff)
-    rank_loss = F.relu(margin - diff).mean()
-
-    return bce_weight * bce + (1 - bce_weight) * rank_loss
-```
-
-**在 trainer 中使用**：
-
-```python
-# trainer.py::_train_step()
-if self.loss_type == 'combined_pair':
-    loss = combined_pair_loss(
-        logits, label,
-        bce_weight=self.bce_weight,  # 新增参数，默认 0.7
-        margin=self.rank_margin        # 新增参数，默认 1.0
-    )
+if 'pair' in self.parsed_losses:
+    pos_mask = label == 1
+    neg_mask = label == 0
+    if pos_mask.sum() > 0 and neg_mask.sum() > 0:
+        diff = logits[pos_mask].unsqueeze(1) - logits[neg_mask].unsqueeze(0)
+        rank_loss = F.relu(self.rank_margin - diff).mean()
+    else:
+        rank_loss = torch.tensor(0.0, device=logits.device)
+    loss = loss + self.pair_weight * rank_loss
 ```
 
 ---
@@ -225,7 +203,8 @@ if self.loss_type == 'combined_pair':
 
 | 超参 | 建议范围 | 说明 |
 |------|----------|------|
-| `bce_weight` ($\lambda$) | 0.6 ~ 0.8 | 论文：0.7 是 sweet spot；<0.5 后排序 loss 主导，分类能力退化 |
+| `bce_weight` | 0.5 ~ 1.0 | BCE 项权重；与 `pair_weight` 独立调节 |
+| `pair_weight` | 0.3 ~ 0.7 | Pairwise 项权重；论文 sweet spot 等价于 bce:pair ≈ 0.7:0.3 ~ 0.5:0.5 |
 | `rank_margin` | 1.0 | Hinge loss 的标准取值 |
 | `batch_size` | ≥ 256 | 需要足够大的 batch 保证正负样本共存，否则 ranking loss = 0 |
 
@@ -245,8 +224,8 @@ if self.loss_type == 'combined_pair':
 
 ## 8. 下一步行动建议
 
-1. **短期（本周）**：实现 Combined-Pair（BCE + Hinge），作为 `--loss_type=combined_pair` 选项加入 `trainer.py` 和 `train.py`
-2. **中期**：提交平台实验，对比 `--loss_type=bce` vs `--loss_type=combined_pair --bce_weight=0.7`
+1. **短期（本周）**：实现 Combined-Pair（BCE + Hinge），作为 `--loss_type=bce+pair` 选项加入 `trainer.py` 和 `train.py`
+2. **中期**：提交平台实验，对比 `--loss_type=bce` vs `--loss_type=bce+pair --bce_weight=0.5 --pair_weight=0.5`
 3. **长期**：若效果正向，可尝试 ListNet（需评估 data pipeline 改造成本）
 
 ---

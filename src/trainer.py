@@ -9,7 +9,7 @@ import os
 import glob
 import shutil
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -49,7 +49,9 @@ class PCVRHyFormerRankingTrainer:
         loss_type: str = 'bce',
         focal_alpha: float = 0.75,
         focal_gamma: float = 2.0,
-        bce_weight: float = 0.7,
+        bce_weight: float = 1.0,
+        focal_weight: float = 1.0,
+        pair_weight: float = 0.5,
         rank_margin: float = 1.0,
         sparse_lr: float = 0.05,
         sparse_weight_decay: float = 0.0,
@@ -111,8 +113,21 @@ class PCVRHyFormerRankingTrainer:
         self.focal_alpha: float = focal_alpha
         self.focal_gamma: float = focal_gamma
         self.bce_weight: float = bce_weight
+        self.focal_weight: float = focal_weight
+        self.pair_weight: float = pair_weight
         self.rank_margin: float = rank_margin
         self.reinit_sparse_after_epoch: int = reinit_sparse_after_epoch
+
+        # Parse composite loss_type, e.g. "bce+pair", "bce+focal+pair"
+        self.parsed_losses: Set[str] = set(loss_type.split('+')) - {''}
+        valid_atoms = {'bce', 'focal', 'pair'}
+        invalid = self.parsed_losses - valid_atoms
+        if invalid:
+            raise ValueError(
+                f"Invalid loss_type atoms in '{loss_type}': {invalid}. "
+                f"Supported atoms: {valid_atoms}. "
+                f"Examples: bce, focal, bce+pair, bce+focal+pair"
+            )
         self.reinit_cardinality_threshold: int = reinit_cardinality_threshold
         self.sparse_lr: float = sparse_lr
         self.sparse_weight_decay: float = sparse_weight_decay
@@ -142,8 +157,10 @@ class PCVRHyFormerRankingTrainer:
             self.sparse_scheduler = None
 
             logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
+                         f"parsed_losses={self.parsed_losses}, "
                          f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
-                         f"bce_weight={bce_weight}, rank_margin={rank_margin}, "
+                         f"bce_weight={bce_weight}, focal_weight={focal_weight}, "
+                         f"pair_weight={pair_weight}, rank_margin={rank_margin}, "
                          f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
                          f"dense_scheduler=warmup({warmup_epochs}ep)+cosine({cosine_t_max_epochs}ep), "
                          f"warmup_steps={warmup_steps}/{total_steps}, "
@@ -156,8 +173,10 @@ class PCVRHyFormerRankingTrainer:
             self.sparse_scheduler = None
             self._lr_lambda = None
             logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
+                         f"parsed_losses={self.parsed_losses}, "
                          f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
-                         f"bce_weight={bce_weight}, rank_margin={rank_margin}, "
+                         f"bce_weight={bce_weight}, focal_weight={focal_weight}, "
+                         f"pair_weight={pair_weight}, rank_margin={rank_margin}, "
                          f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
                          f"dense_scheduler=disabled, "
                          f"scheduler_dense_only={scheduler_dense_only}")
@@ -481,8 +500,8 @@ class PCVRHyFormerRankingTrainer:
         """Run a single training step and return loss components.
 
         Returns:
-            Dict with at least 'total' key. For combined_pair, also includes
-            'bce' and 'rank' keys for TensorBoard logging.
+            Dict with at least 'total' key. For composite losses (e.g. bce+pair),
+            also includes 'bce', 'focal', and/or 'rank' keys for TensorBoard logging.
         """
         device_batch = self._batch_to_device(batch)
         label = device_batch['label'].float()
@@ -495,13 +514,22 @@ class PCVRHyFormerRankingTrainer:
         logits = self.model(model_input)  # (B, 1)
         logits = logits.squeeze(-1)  # (B,)
 
-        if self.loss_type == 'focal':
-            loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
-            loss_dict = {'total': loss}
-        elif self.loss_type == 'combined_pair':
-            # ---- Combined-Pair: BCE + pairwise hinge ranking loss ----
-            bce_loss = F.binary_cross_entropy_with_logits(logits, label)
+        loss = torch.tensor(0.0, device=logits.device)
+        loss_dict = {}
 
+        if 'bce' in self.parsed_losses:
+            bce_loss = F.binary_cross_entropy_with_logits(logits, label)
+            loss = loss + self.bce_weight * bce_loss
+            loss_dict['bce'] = bce_loss
+
+        if 'focal' in self.parsed_losses:
+            focal_loss = sigmoid_focal_loss(
+                logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma
+            )
+            loss = loss + self.focal_weight * focal_loss
+            loss_dict['focal'] = focal_loss
+
+        if 'pair' in self.parsed_losses:
             pos_mask = label == 1
             neg_mask = label == 0
             if pos_mask.sum() > 0 and neg_mask.sum() > 0:
@@ -513,16 +541,10 @@ class PCVRHyFormerRankingTrainer:
             else:
                 # No pairs available in this batch → ranking term = 0
                 rank_loss = torch.tensor(0.0, device=logits.device)
+            loss = loss + self.pair_weight * rank_loss
+            loss_dict['rank'] = rank_loss
 
-            loss = self.bce_weight * bce_loss + (1 - self.bce_weight) * rank_loss
-            loss_dict = {
-                'total': loss,
-                'bce': bce_loss,
-                'rank': rank_loss,
-            }
-        else:
-            loss = F.binary_cross_entropy_with_logits(logits, label)
-            loss_dict = {'total': loss}
+        loss_dict['total'] = loss
 
         loss.backward()
         # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
