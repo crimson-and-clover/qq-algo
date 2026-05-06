@@ -2,7 +2,14 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 
-# ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
+# ---- Mode: data exploration (prints report to stdout & train.log) ----
+# Uncomment the block below to run data explorer on the platform dataset.
+# The platform sets TRAIN_DATA_PATH / TRAIN_LOG_PATH via env.
+# python3 -u "${SCRIPT_DIR}/data_explorer.py" \
+#     "$@"
+
+# ---- Mode: training (default) ----
+# Active config: RankMixer NS tokenizer + combined_pair loss (no ns_groups.json required)
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
     --user_ns_tokens 5 \
@@ -11,7 +18,25 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \
+    --use_target_attention \
+    --no_scheduler \
+    --loss_type combined_pair \
+    --bce_weight 0.5 \
+    --rank_margin 1.0 \
     "$@"
+
+# ---- Legacy config: BCE loss (baseline) ----
+# python3 -u "${SCRIPT_DIR}/train.py" \
+#     --ns_tokenizer_type rankmixer \
+#     --user_ns_tokens 5 \
+#     --item_ns_tokens 2 \
+#     --num_queries 2 \
+#     --ns_groups_json "" \
+#     --emb_skip_threshold 1000000 \
+#     --num_workers 8 \
+#     --use_target_attention \
+#     --no_scheduler \
+#     "$@"
 
 # ---- Alternative config: GroupNSTokenizer driven by ns_groups.json ----
 # Uses feature grouping from ns_groups.json (7 user groups + 4 item groups).

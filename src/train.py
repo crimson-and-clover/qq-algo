@@ -50,6 +50,8 @@ def parse_args() -> argparse.Namespace:
                         help='Checkpoint output directory (env: TRAIN_CKPT_PATH)')
     parser.add_argument('--log_dir', type=str, default=None,
                         help='Log directory (env: TRAIN_LOG_PATH)')
+    parser.add_argument('--tf_events_dir', type=str, default=None,
+                        help='TensorBoard events directory (env: TRAIN_TF_EVENTS_PATH)')
 
     # Training hyperparameters.
     parser.add_argument('--batch_size', type=int, default=256,
@@ -75,7 +77,7 @@ def parse_args() -> argparse.Namespace:
                         help='Shuffle buffer size, in units of batches. '
                              'Lower values reduce memory usage.')
     parser.add_argument('--train_ratio', type=float, default=1.0,
-                        help='Fraction of training Row Groups to use (takes the first N%)')
+                        help='Fraction of training Row Groups to use (takes the first N%%)')
     parser.add_argument('--valid_ratio', type=float, default=0.1,
                         help='Fraction of all Row Groups used for validation (takes the tail)')
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
@@ -135,14 +137,23 @@ def parse_args() -> argparse.Namespace:
                         help='RoPE base frequency (default 10000)')
 
     # Loss function.
-    parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
-                        help='Loss type: bce = BCEWithLogits, focal = Focal Loss')
-    parser.add_argument('--focal_alpha', type=float, default=0.1,
+    parser.add_argument('--loss_type', type=str, default='bce',
+                        choices=['bce', 'focal', 'combined_pair'],
+                        help='Loss type: bce = BCEWithLogits, focal = Focal Loss, '
+                             'combined_pair = BCE + pairwise hinge ranking loss')
+    parser.add_argument('--focal_alpha', type=float, default=0.75,
                         help='Focal Loss positive-class weight alpha '
-                             '(effective only when --loss_type=focal)')
+                             '(effective only when --loss_type=focal). '
+                             'Default 0.75 compensates for extreme CVR imbalance.')
     parser.add_argument('--focal_gamma', type=float, default=2.0,
                         help='Focal Loss focusing parameter gamma '
                              '(effective only when --loss_type=focal)')
+    parser.add_argument('--bce_weight', type=float, default=0.7,
+                        help='Weight for BCE term in combined_pair loss '
+                             '(default 0.7). Ranking term weight = 1 - bce_weight.')
+    parser.add_argument('--rank_margin', type=float, default=1.0,
+                        help='Hinge margin for pairwise ranking loss '
+                             'in combined_pair (default 1.0)')
 
     # Sparse optimizer.
     parser.add_argument('--sparse_lr', type=float, default=0.05,
@@ -159,6 +170,29 @@ def parse_args() -> argparse.Namespace:
                         help='Cardinality threshold used by the re-init strategy: '
                              'Embeddings whose vocab_size exceeds this value are reset '
                              'at each epoch end (0 = never reset any Embedding)')
+
+    # Learning rate schedule (dense optimizer only).
+    parser.add_argument('--warmup_epochs', type=int, default=2,
+                        help='Number of epochs for linear warm-up of the dense optimizer '
+                             '(default 2). Set to 0 to disable warm-up.')
+    parser.add_argument('--cosine_t_max_epochs', type=int, default=None,
+                        help='Cosine annealing period in epochs for the dense optimizer '
+                             '(default: same as num_epochs). Should be >= warmup_epochs. '
+                             'When num_epochs is large (e.g. 999), leaving this unset '
+                             'makes cosine cover the whole training, avoiding a frozen LR.')
+    parser.add_argument('--min_lr_ratio', type=float, default=0.01,
+                        help='Minimum LR as a fraction of the initial LR for Cosine Annealing '
+                             '(default 0.01 = 1%% of initial LR)')
+    parser.add_argument('--scheduler_dense_only', action='store_true', default=True,
+                        help='If set, only apply LR schedule to the dense optimizer (AdamW). '
+                             'Sparse optimizer (Adagrad) keeps its initial LR. '
+                             '(Default True to keep sparse behavior identical to baseline).')
+    parser.add_argument('--no_scheduler', action='store_true', default=False,
+                        help='Disable the dense optimizer LR scheduler '
+                             '(warm-up + cosine annealing).')
+    parser.add_argument('--dense_weight_decay', type=float, default=0.0,
+                        help='Weight decay for AdamW dense optimizer (default 0.0). '
+                             'Baseline used 0.0; only enable after scheduler is validated.')
 
     # Embedding construction control.
     parser.add_argument('--emb_skip_threshold', type=int, default=0,
@@ -194,13 +228,25 @@ def parse_args() -> argparse.Namespace:
                         help='Number of item NS tokens in rankmixer mode '
                              '(0 = automatically use the number of item groups)')
 
+    # QueryGenerator variant.
+    parser.add_argument('--use_target_attention', action='store_true', default=False,
+                        help='Enable Target-Attention in QueryGenerator. '
+                             'If set, item-side NS tokens are used as query '
+                             'to attend over each sequence instead of MeanPool.')
+
     args = parser.parse_args()
 
     # Environment variables take precedence.
     args.data_dir = os.environ.get('TRAIN_DATA_PATH', args.data_dir)
     args.ckpt_dir = os.environ.get('TRAIN_CKPT_PATH', args.ckpt_dir)
     args.log_dir = os.environ.get('TRAIN_LOG_PATH', args.log_dir)
-    args.tf_events_dir = os.environ.get('TRAIN_TF_EVENTS_PATH')
+    args.tf_events_dir = os.environ.get('TRAIN_TF_EVENTS_PATH', args.tf_events_dir)
+
+    # Default cosine_t_max_epochs to num_epochs so that the scheduler covers the
+    # whole training. Prevents the trap where num_epochs=999 but cosine only
+    # runs for 20 epochs, leaving the LR frozen at min_lr_ratio for 97% of training.
+    if args.cosine_t_max_epochs is None:
+        args.cosine_t_max_epochs = args.num_epochs
 
     return args
 
@@ -301,6 +347,7 @@ def main() -> None:
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
+        "use_target_attention": args.use_target_attention,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
@@ -309,7 +356,8 @@ def main() -> None:
     num_sequences = len(pcvr_dataset.seq_domains)
     num_ns = model.num_ns
     T = args.num_queries * num_sequences + num_ns
-    logging.info(f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, d_model={args.d_model}, rank_mixer_mode={args.rank_mixer_mode}")
+    logging.info(f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, d_model={args.d_model}, "
+                 f"rank_mixer_mode={args.rank_mixer_mode}, use_target_attention={args.use_target_attention}")
     logging.info(f"User NS groups: {user_ns_groups}")
     logging.info(f"Item NS groups: {item_ns_groups}")
     total_params = sum(p.numel() for p in model.parameters())
@@ -340,8 +388,11 @@ def main() -> None:
         loss_type=args.loss_type,
         focal_alpha=args.focal_alpha,
         focal_gamma=args.focal_gamma,
+        bce_weight=args.bce_weight,
+        rank_margin=args.rank_margin,
         sparse_lr=args.sparse_lr,
         sparse_weight_decay=args.sparse_weight_decay,
+        dense_weight_decay=args.dense_weight_decay,
         reinit_sparse_after_epoch=args.reinit_sparse_after_epoch,
         reinit_cardinality_threshold=args.reinit_cardinality_threshold,
         ckpt_params=ckpt_params,
@@ -350,6 +401,11 @@ def main() -> None:
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         eval_every_n_steps=args.eval_every_n_steps,
         train_config=vars(args),
+        warmup_epochs=args.warmup_epochs,
+        cosine_t_max_epochs=args.cosine_t_max_epochs,
+        min_lr_ratio=args.min_lr_ratio,
+        scheduler_dense_only=args.scheduler_dense_only,
+        use_scheduler=not args.no_scheduler,
     )
 
     trainer.train()

@@ -4,6 +4,7 @@ Despite the historical "Ranking" suffix in the class name, the training loop
 uses pointwise BCE / Focal loss and evaluates Binary AUC + binary logloss.
 """
 
+import math
 import os
 import glob
 import shutil
@@ -46,10 +47,13 @@ class PCVRHyFormerRankingTrainer:
         save_dir: str,
         early_stopping: EarlyStopping,
         loss_type: str = 'bce',
-        focal_alpha: float = 0.1,
+        focal_alpha: float = 0.75,
         focal_gamma: float = 2.0,
+        bce_weight: float = 0.7,
+        rank_margin: float = 1.0,
         sparse_lr: float = 0.05,
         sparse_weight_decay: float = 0.0,
+        dense_weight_decay: float = 0.0,
         reinit_sparse_after_epoch: int = 1,
         reinit_cardinality_threshold: int = 0,
         ckpt_params: Optional[Dict[str, Any]] = None,
@@ -58,6 +62,11 @@ class PCVRHyFormerRankingTrainer:
         ns_groups_path: Optional[str] = None,
         eval_every_n_steps: int = 0,
         train_config: Optional[Dict[str, Any]] = None,
+        warmup_epochs: int = 2,
+        cosine_t_max_epochs: int = 20,
+        min_lr_ratio: float = 0.01,
+        scheduler_dense_only: bool = True,
+        use_scheduler: bool = True,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -80,17 +89,18 @@ class PCVRHyFormerRankingTrainer:
             sparse_param_count = sum(p.numel() for p in sparse_params)
             dense_param_count = sum(p.numel() for p in dense_params)
             logging.info(f"Sparse params: {len(sparse_params)} tensors, {sparse_param_count:,} parameters (Adagrad lr={sparse_lr})")
-            logging.info(f"Dense params: {len(dense_params)} tensors, {dense_param_count:,} parameters (AdamW lr={lr})")
+            logging.info(f"Dense params: {len(dense_params)} tensors, {dense_param_count:,} parameters (AdamW lr={lr}, wd={dense_weight_decay})")
             self.sparse_optimizer = torch.optim.Adagrad(
                 sparse_params, lr=sparse_lr, weight_decay=sparse_weight_decay
             )
+            # Old: torch.optim.AdamW(dense_params, lr=lr, betas=(0.9, 0.98))
             self.dense_optimizer: torch.optim.Optimizer = torch.optim.AdamW(
-                dense_params, lr=lr, betas=(0.9, 0.98)
+                dense_params, lr=lr, betas=(0.9, 0.98), weight_decay=dense_weight_decay
             )
         else:
             self.sparse_optimizer = None
             self.dense_optimizer = torch.optim.AdamW(
-                model.parameters(), lr=lr, betas=(0.9, 0.98)
+                model.parameters(), lr=lr, betas=(0.9, 0.98), weight_decay=dense_weight_decay
             )
 
         self.num_epochs: int = num_epochs
@@ -100,6 +110,8 @@ class PCVRHyFormerRankingTrainer:
         self.loss_type: str = loss_type
         self.focal_alpha: float = focal_alpha
         self.focal_gamma: float = focal_gamma
+        self.bce_weight: float = bce_weight
+        self.rank_margin: float = rank_margin
         self.reinit_sparse_after_epoch: int = reinit_sparse_after_epoch
         self.reinit_cardinality_threshold: int = reinit_cardinality_threshold
         self.sparse_lr: float = sparse_lr
@@ -108,9 +120,57 @@ class PCVRHyFormerRankingTrainer:
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
 
-        logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
-                     f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
-                     f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
+        # ---- LR Scheduler: Linear Warm-up + Cosine Annealing (dense only) ----
+        self.min_lr_ratio: float = min_lr_ratio
+        self.scheduler_dense_only: bool = scheduler_dense_only
+        self.use_scheduler: bool = use_scheduler
+        if use_scheduler:
+            # Use fixed epoch counts instead of num_epochs so that an oversized
+            # num_epochs (e.g. 999) does not trap the schedule in warm-up forever.
+            steps_per_epoch = len(train_loader)
+            total_steps = steps_per_epoch * cosine_t_max_epochs
+            warmup_steps = steps_per_epoch * warmup_epochs
+            self.warmup_steps: int = warmup_steps
+            self.total_steps: int = total_steps
+
+            self._lr_lambda = self._build_lr_lambda(warmup_steps, total_steps, min_lr_ratio)
+
+            self.dense_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                self.dense_optimizer, self._lr_lambda)
+            # Sparse optimizer stays at its fixed initial LR to match baseline
+            # behaviour and avoid reinit-related scheduler resets.
+            self.sparse_scheduler = None
+
+            logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
+                         f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
+                         f"bce_weight={bce_weight}, rank_margin={rank_margin}, "
+                         f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
+                         f"dense_scheduler=warmup({warmup_epochs}ep)+cosine({cosine_t_max_epochs}ep), "
+                         f"warmup_steps={warmup_steps}/{total_steps}, "
+                         f"min_lr_ratio={min_lr_ratio}, "
+                         f"scheduler_dense_only={scheduler_dense_only}")
+        else:
+            self.warmup_steps = 0
+            self.total_steps = 0
+            self.dense_scheduler = None
+            self.sparse_scheduler = None
+            self._lr_lambda = None
+            logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
+                         f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
+                         f"bce_weight={bce_weight}, rank_margin={rank_margin}, "
+                         f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
+                         f"dense_scheduler=disabled, "
+                         f"scheduler_dense_only={scheduler_dense_only}")
+
+    @staticmethod
+    def _build_lr_lambda(warmup_steps: int, total_steps: int, min_lr_ratio: float):
+        """Return a closure for LambdaLR that applies Linear Warm-up + Cosine Annealing."""
+        def lr_lambda(current_step: int) -> float:
+            if current_step < warmup_steps:
+                return current_step / max(1, warmup_steps)
+            progress = (current_step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+        return lr_lambda
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -301,14 +361,32 @@ class PCVRHyFormerRankingTrainer:
             loss_sum = 0.0
 
             for step, batch in train_pbar:
-                loss = self._train_step(batch)
+                loss_dict = self._train_step(batch)
+                loss = loss_dict['total']
                 total_step += 1
                 loss_sum += loss
 
+                # Step LR scheduler after each optimizer step (dense only).
+                if self.dense_scheduler is not None:
+                    self.dense_scheduler.step()
+
                 if self.writer:
                     self.writer.add_scalar('Loss/train', loss, total_step)
+                    self.writer.add_scalar('LR/dense', self.dense_optimizer.param_groups[0]['lr'], total_step)
+                    if 'bce' in loss_dict:
+                        self.writer.add_scalar('Loss/bce', loss_dict['bce'], total_step)
+                    if 'rank' in loss_dict:
+                        self.writer.add_scalar('Loss/rank', loss_dict['rank'], total_step)
 
-                train_pbar.set_postfix({"loss": f"{loss:.4f}"})
+                postfix = {
+                    "loss": f"{loss:.4f}",
+                    "lr": f"{self.dense_optimizer.param_groups[0]['lr']:.2e}",
+                }
+                if 'bce' in loss_dict:
+                    postfix['bce'] = f"{loss_dict['bce']:.4f}"
+                if 'rank' in loss_dict:
+                    postfix['rank'] = f"{loss_dict['rank']:.4f}"
+                train_pbar.set_postfix(postfix)
 
                 # Step-level validation (only when eval_every_n_steps > 0).
                 if self.eval_every_n_steps > 0 and total_step % self.eval_every_n_steps == 0:
@@ -399,8 +477,13 @@ class PCVRHyFormerRankingTrainer:
             seq_time_buckets=seq_time_buckets,
         )
 
-    def _train_step(self, batch: Dict[str, Any]) -> float:
-        """Run a single training step and return the scalar loss value."""
+    def _train_step(self, batch: Dict[str, Any]) -> Dict[str, float]:
+        """Run a single training step and return loss components.
+
+        Returns:
+            Dict with at least 'total' key. For combined_pair, also includes
+            'bce' and 'rank' keys for TensorBoard logging.
+        """
         device_batch = self._batch_to_device(batch)
         label = device_batch['label'].float()
 
@@ -414,8 +497,33 @@ class PCVRHyFormerRankingTrainer:
 
         if self.loss_type == 'focal':
             loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+            loss_dict = {'total': loss}
+        elif self.loss_type == 'combined_pair':
+            # ---- Combined-Pair: BCE + pairwise hinge ranking loss ----
+            bce_loss = F.binary_cross_entropy_with_logits(logits, label)
+
+            pos_mask = label == 1
+            neg_mask = label == 0
+            if pos_mask.sum() > 0 and neg_mask.sum() > 0:
+                pos_logits = logits[pos_mask]   # (N+,)
+                neg_logits = logits[neg_mask]   # (N-,)
+                # Broadcast: (N+, 1) - (1, N-) -> (N+, N-)
+                diff = pos_logits.unsqueeze(1) - neg_logits.unsqueeze(0)
+                rank_loss = F.relu(self.rank_margin - diff).mean()
+            else:
+                # No pairs available in this batch → ranking term = 0
+                rank_loss = torch.tensor(0.0, device=logits.device)
+
+            loss = self.bce_weight * bce_loss + (1 - self.bce_weight) * rank_loss
+            loss_dict = {
+                'total': loss,
+                'bce': bce_loss,
+                'rank': rank_loss,
+            }
         else:
             loss = F.binary_cross_entropy_with_logits(logits, label)
+            loss_dict = {'total': loss}
+
         loss.backward()
         # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
         # with certain tensor shapes in this project.
@@ -425,7 +533,8 @@ class PCVRHyFormerRankingTrainer:
         if self.sparse_optimizer is not None:
             self.sparse_optimizer.step()
 
-        return loss.item()
+        # Convert to Python floats for return
+        return {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in loss_dict.items()}
 
     def evaluate(self, epoch: Optional[int] = None) -> Tuple[float, float]:
         """Run validation over ``self.valid_loader`` and return ``(AUC, logloss)``.

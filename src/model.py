@@ -415,9 +415,14 @@ class RankMixerBlock(nn.Module):
 class MultiSeqQueryGenerator(nn.Module):
     """Multi-sequence query generation module.
 
-    Generates Q tokens independently for each sequence:
+    Generates Q tokens independently for each sequence.
+    Supports two pooling modes for the sequence representation:
+
+    1. MeanPool (default): GlobalInfo_i = Concat(F1..FM, MeanPool(Seq_i))
+    2. Target-Attention (DIN): GlobalInfo_i = Concat(F1..FM, AttnPool(Seq_i, Target))
+       where Target is the item-side NS token representation.
+
     For each sequence i:
-        GlobalInfo_i = Concat(F1..FM, MeanPool(Seq_i))
         Q_i = [FFN_{i,1}(GlobalInfo_i), ..., FFN_{i,N}(GlobalInfo_i)]
     """
 
@@ -427,12 +432,14 @@ class MultiSeqQueryGenerator(nn.Module):
         num_ns: int,
         num_queries: int,
         num_sequences: int,
-        hidden_mult: int = 4
+        hidden_mult: int = 4,
+        use_target_attention: bool = False,
     ) -> None:
         super().__init__()
         self.num_queries = num_queries
         self.num_sequences = num_sequences
         self.d_model = d_model
+        self.use_target_attention = use_target_attention
 
         global_info_dim = (num_ns + 1) * d_model
 
@@ -453,11 +460,19 @@ class MultiSeqQueryGenerator(nn.Module):
             for _ in range(num_sequences)
         ])
 
+        if use_target_attention:
+            # Project aggregated target tokens to query space.
+            self.target_proj = nn.Linear(d_model, d_model)
+            self.attention_scale = math.sqrt(d_model)
+        else:
+            self.target_proj = None
+
     def forward(
         self,
         ns_tokens: torch.Tensor,
         seq_tokens_list: list,
-        seq_padding_masks: list
+        seq_padding_masks: list,
+        target_tokens: Optional[torch.Tensor] = None,
     ) -> list:
         """Generates query tokens for each sequence.
 
@@ -466,6 +481,8 @@ class MultiSeqQueryGenerator(nn.Module):
             seq_tokens_list: List of (B, L_i, D) tensors, length S.
             seq_padding_masks: List of (B, L_i) masks, length S. True
                 indicates padding.
+            target_tokens: (B, T, D) item-side NS tokens. Only used when
+                ``use_target_attention=True``.
 
         Returns:
             List of (B, Nq, D) query token tensors, length S.
@@ -473,14 +490,41 @@ class MultiSeqQueryGenerator(nn.Module):
         B = ns_tokens.shape[0]
         ns_flat = ns_tokens.view(B, -1)  # (B, M*D)
 
+        # Aggregate target tokens to a single query vector when provided.
+        target_query = None
+        if self.use_target_attention and target_tokens is not None:
+            # (B, T, D) -> (B, D) via mean pooling over target tokens
+            target_query = self.target_proj(target_tokens.mean(dim=1))  # (B, D)
+
         q_tokens_list = []
         for i in range(self.num_sequences):
-            # MeanPool(Seq_i)
-            valid_mask = ~seq_padding_masks[i]  # True = valid
-            valid_mask_expanded = valid_mask.unsqueeze(-1).float()  # (B, L_i, 1)
-            seq_sum = (seq_tokens_list[i] * valid_mask_expanded).sum(dim=1)  # (B, D)
-            seq_count = valid_mask_expanded.sum(dim=1).clamp(min=1)  # (B, 1)
-            seq_pooled = seq_sum / seq_count  # (B, D)
+            if target_query is not None:
+                # ---- Target-Attention pooling (DIN-style) ----
+                # scores: (B, L_i)
+                scores = torch.matmul(
+                    seq_tokens_list[i], target_query.unsqueeze(-1)
+                ).squeeze(-1) / self.attention_scale
+
+                # Numerically-stable masked softmax.
+                # Using -1e9 instead of -inf avoids NaN in all-padding rows
+                # (softmax over all -inf is undefined / NaN in PyTorch).
+                scores = scores.masked_fill(seq_padding_masks[i], -1e9)
+                max_score = scores.max(dim=-1, keepdim=True).values
+                exp_scores = torch.exp(scores - max_score)
+                exp_scores = exp_scores.masked_fill(seq_padding_masks[i], 0.0)
+                sum_exp = exp_scores.sum(dim=-1, keepdim=True)
+                attn_weights = exp_scores / (sum_exp + 1e-10)  # (B, L_i)
+
+                # Weighted sum: (B, L_i, 1) * (B, L_i, D) -> (B, D)
+                # For all-padding rows sum_exp=0 -> attn_weights=0 -> seq_pooled=0.
+                seq_pooled = (attn_weights.unsqueeze(-1) * seq_tokens_list[i]).sum(dim=1)
+            else:
+                # ---- MeanPool fallback (baseline behaviour) ----
+                valid_mask = ~seq_padding_masks[i]  # True = valid
+                valid_mask_expanded = valid_mask.unsqueeze(-1).float()  # (B, L_i, 1)
+                seq_sum = (seq_tokens_list[i] * valid_mask_expanded).sum(dim=1)  # (B, D)
+                seq_count = valid_mask_expanded.sum(dim=1).clamp(min=1)  # (B, 1)
+                seq_pooled = seq_sum / seq_count  # (B, D)
 
             # GlobalInfo_i = Concat(NS_flat, seq_pooled_i)
             global_info = torch.cat([ns_flat, seq_pooled], dim=-1)  # (B, (M+1)*D)
@@ -1229,6 +1273,8 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # QueryGenerator variant
+        use_target_attention: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1385,6 +1431,7 @@ class PCVRHyFormer(nn.Module):
             num_queries=num_queries,
             num_sequences=self.num_sequences,
             hidden_mult=hidden_mult,
+            use_target_attention=use_target_attention,
         )
 
         # MultiSeqHyFormerBlock stack
@@ -1662,7 +1709,10 @@ class PCVRHyFormer(nn.Module):
             seq_masks_list.append(mask)
 
         # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
-        q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
+        q_tokens_list = self.query_generator(
+            ns_tokens, seq_tokens_list, seq_masks_list,
+            target_tokens=item_ns if self.query_generator.use_target_attention else None,
+        )
 
         # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
         output = self._run_multi_seq_blocks(
@@ -1703,7 +1753,10 @@ class PCVRHyFormer(nn.Module):
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
 
-        q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
+        q_tokens_list = self.query_generator(
+            ns_tokens, seq_tokens_list, seq_masks_list,
+            target_tokens=item_ns if self.query_generator.use_target_attention else None,
+        )
 
         output = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
