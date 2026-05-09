@@ -18,7 +18,8 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \
-    --use_target_attention \
+    --batch_size 512 \
+    --overlap 256 \
     --no_scheduler \
     --loss_type bce+info \
     --bce_weight 1.0 \

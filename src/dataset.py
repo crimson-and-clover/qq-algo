@@ -153,6 +153,7 @@ class PCVRParquetDataset(IterableDataset):
         row_group_range: Optional[Tuple[int, int]] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
+        overlap: int = 0,
     ) -> None:
         """
         Args:
@@ -170,6 +171,10 @@ class PCVRParquetDataset(IterableDataset):
             clip_vocab: if True, clip out-of-bound ids to 0; if False, raise.
             is_training: if True, derive ``label`` from ``label_type == 2``;
                 if False, return an all-zeros label column.
+            overlap: number of rows overlapped between consecutive batches
+                (sliding window). Only effective when shuffle=True and
+                buffer_batches > 0. The overlapped rows are excluded from
+                BCE / Pair / Focal loss but participate in InfoNCE.
         """
         super().__init__()
 
@@ -188,6 +193,7 @@ class PCVRParquetDataset(IterableDataset):
         self.buffer_batches = buffer_batches
         self.clip_vocab = clip_vocab
         self.is_training = is_training
+        self.overlap = overlap
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
@@ -336,7 +342,10 @@ class PCVRParquetDataset(IterableDataset):
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         worker_info = torch.utils.data.get_worker_info()
-        rg_list = self._rg_list
+        # File-level shuffle: copy and randomize Row Group order per epoch.
+        rg_list = list(self._rg_list)
+        if self.shuffle:
+            random.shuffle(rg_list)
         if worker_info is not None and worker_info.num_workers > 1:
             rg_list = [rg for i, rg in enumerate(rg_list)
                        if i % worker_info.num_workers == worker_info.id]
@@ -365,6 +374,11 @@ class PCVRParquetDataset(IterableDataset):
     ) -> Iterator[Dict[str, Any]]:
         """Concatenate the buffered batches, shuffle at the row level, then
         re-slice and yield batch-sized chunks.
+
+        When ``overlap > 0``, a sliding window is used so that consecutive
+        batches share ``overlap`` rows.  The overlapped rows are tagged with
+        ``loss_mask=False`` so that downstream losses (BCE / Pair / Focal)
+        ignore them, while InfoNCE still sees the full batch.
         """
         merged: Dict[str, torch.Tensor] = {}
         non_tensor_keys: Dict[str, Any] = {}
@@ -375,10 +389,27 @@ class PCVRParquetDataset(IterableDataset):
                 non_tensor_keys[k] = buffer[0][k]
         total_rows = merged['label'].shape[0]
         rand_idx = torch.randperm(total_rows) if self.shuffle else torch.arange(total_rows)
-        for i in range(0, total_rows, self.batch_size):
+
+        # Sliding-window step: batch_size - overlap.
+        step = max(self.batch_size - self.overlap, 1)
+        for i in range(0, total_rows, step):
             end = min(i + self.batch_size, total_rows)
+            # Skip the final truncated batch so that every yielded batch has
+            # exactly ``batch_size`` rows (required by pre-allocated buffers).
+            if end - i < self.batch_size:
+                break
             batch: Dict[str, Any] = {k: v[rand_idx[i:end]] for k, v in merged.items()}
             batch.update(non_tensor_keys)
+
+            # loss_mask: True for "new" rows, False for overlapped rows.
+            # The first batch in a flush buffer has no predecessor, so it is
+            # all-new.  Subsequent batches share their first ``overlap`` rows
+            # with the previous batch's tail.
+            loss_mask = torch.ones(self.batch_size, dtype=torch.bool)
+            if self.overlap > 0 and i > 0:
+                loss_mask[:self.overlap] = False
+            batch['loss_mask'] = loss_mask
+            batch['sample_weight'] = loss_mask.float()
             yield batch
         del merged
         buffer.clear()
@@ -681,6 +712,7 @@ def get_pcvr_data(
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
+    overlap: int = 0,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -729,6 +761,7 @@ def get_pcvr_data(
         buffer_batches=buffer_batches,
         row_group_range=(0, n_train_rgs),
         clip_vocab=clip_vocab,
+        overlap=overlap,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -758,6 +791,6 @@ def get_pcvr_data(
     )
 
     logging.info(f"Parquet train: {train_rows} rows, valid: {valid_rows} rows, "
-                 f"batch_size={batch_size}, buffer_batches={buffer_batches}")
+                 f"batch_size={batch_size}, overlap={overlap}, buffer_batches={buffer_batches}")
 
     return train_loader, valid_loader, train_dataset

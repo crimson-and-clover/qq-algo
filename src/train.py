@@ -76,6 +76,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--buffer_batches', type=int, default=20,
                         help='Shuffle buffer size, in units of batches. '
                              'Lower values reduce memory usage.')
+    parser.add_argument('--overlap', type=int, default=0,
+                        help='Number of rows overlapped between consecutive training batches. '
+                             'Only effective with shuffle=True. Overlapped rows participate in '
+                             'InfoNCE but are excluded from BCE / Pair / Focal loss.')
     parser.add_argument('--train_ratio', type=float, default=1.0,
                         help='Fraction of training Row Groups to use (takes the first N%%)')
     parser.add_argument('--valid_ratio', type=float, default=0.1,
@@ -302,6 +306,7 @@ def main() -> None:
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
+        overlap=args.overlap,
     )
 
     # ---- NS groups ----

@@ -539,6 +539,12 @@ class PCVRHyFormerRankingTrainer:
         device_batch = self._batch_to_device(batch)
         label = device_batch['label'].float()
 
+        # loss_mask: True for "new" rows, False for overlapped rows.
+        # Overlapped rows participate in InfoNCE but are excluded from
+        # BCE / Pair / Focal to avoid duplicate gradient signals.
+        loss_mask = device_batch.get('loss_mask', torch.ones_like(label, dtype=torch.bool))
+        sample_weight = device_batch.get('sample_weight', torch.ones_like(label))
+
         self.dense_optimizer.zero_grad()
         if self.sparse_optimizer is not None:
             self.sparse_optimizer.zero_grad()
@@ -552,28 +558,56 @@ class PCVRHyFormerRankingTrainer:
             logits = self.model(model_input)  # (B, 1)
         logits = logits.squeeze(-1)  # (B,)
 
+        # Masked logits/labels for losses that should ignore overlap rows.
+        valid_logits = logits[loss_mask]
+        valid_label = label[loss_mask]
+        valid_weight = sample_weight[loss_mask]
+
         loss = torch.tensor(0.0, device=logits.device)
         loss_dict = {}
 
         if 'bce' in self.parsed_losses:
-            bce_loss = F.binary_cross_entropy_with_logits(logits, label)
+            # Dynamic pos_weight based on the actual pos/neg ratio in valid rows.
+            pos_count = valid_label.sum().float()
+            neg_count = (~valid_label.bool()).sum().float()
+            pos_weight_val = torch.sqrt(neg_count / max(pos_count, 1.0))
+            per_sample_weight = torch.where(
+                valid_label == 1, pos_weight_val, torch.tensor(1.0, device=valid_label.device)
+            )
+            # Renormalise so that the weighted mean stays in a stable range.
+            per_sample_weight = per_sample_weight / max(per_sample_weight.sum(), 1.0) * valid_label.numel()
+
+            bce_per_sample = F.binary_cross_entropy_with_logits(
+                valid_logits, valid_label, reduction='none'
+            )
+            bce_loss = (bce_per_sample * per_sample_weight).mean()
             loss = loss + self.bce_weight * bce_loss
             loss_dict['bce'] = bce_loss
 
         if 'focal' in self.parsed_losses:
             focal_loss = sigmoid_focal_loss(
-                logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma
+                valid_logits, valid_label, alpha=self.focal_alpha, gamma=self.focal_gamma
             )
             loss = loss + self.focal_weight * focal_loss
             loss_dict['focal'] = focal_loss
 
         if 'pair' in self.parsed_losses:
-            pos_mask = label == 1
-            neg_mask = label == 0
+            pos_mask = valid_label == 1
+            neg_mask = valid_label == 0
             if pos_mask.sum() > 0 and neg_mask.sum() > 0:
-                pos_logits = logits[pos_mask]   # (N+,)
-                neg_logits = logits[neg_mask]   # (N-,)
-                # Broadcast: (N+, 1) - (1, N-) -> (N+, N-)
+                pos_logits = valid_logits[pos_mask]   # (N+,)
+                neg_logits = valid_logits[neg_mask]   # (N-,)
+                # Safe Pair Loss: repeat-sample the minority class so that
+                # we can construct a dense (N, N) difference matrix even when
+                # the batch is heavily imbalanced.
+                n_pos, n_neg = pos_logits.shape[0], neg_logits.shape[0]
+                if n_pos < n_neg:
+                    repeat = (n_neg + n_pos - 1) // n_pos
+                    pos_logits = pos_logits.repeat(repeat)[:n_neg]
+                elif n_neg < n_pos:
+                    repeat = (n_pos + n_neg - 1) // n_neg
+                    neg_logits = neg_logits.repeat(repeat)[:n_pos]
+                # Broadcast: (N, 1) - (1, N) -> (N, N)
                 diff = pos_logits.unsqueeze(1) - neg_logits.unsqueeze(0)
                 rank_loss = F.relu(self.rank_margin - diff).mean()
             else:
@@ -583,6 +617,8 @@ class PCVRHyFormerRankingTrainer:
             loss_dict['rank'] = rank_loss
 
         if 'info' in self.parsed_losses:
+            # InfoNCE uses the FULL batch (including overlap rows) to maximise
+            # the negative sample pool.
             info_loss = supervised_infonce(emb, label, tau=self.info_tau)
             loss = loss + self.info_weight * info_loss
             loss_dict['info'] = info_loss
