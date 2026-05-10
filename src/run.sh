@@ -19,7 +19,6 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \
     --batch_size 512 \
-    --overlap 256 \
     --no_scheduler \
     --loss_type bce+info \
     --bce_weight 1.0 \

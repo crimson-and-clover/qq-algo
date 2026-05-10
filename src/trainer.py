@@ -71,6 +71,7 @@ class PCVRHyFormerRankingTrainer:
         min_lr_ratio: float = 0.01,
         scheduler_dense_only: bool = True,
         use_scheduler: bool = True,
+        tb_log_every_n_steps: int = 1,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -143,6 +144,7 @@ class PCVRHyFormerRankingTrainer:
         self.min_lr_ratio: float = min_lr_ratio
         self.scheduler_dense_only: bool = scheduler_dense_only
         self.use_scheduler: bool = use_scheduler
+        self.tb_log_every_n_steps: int = tb_log_every_n_steps
         if use_scheduler:
             # Use fixed epoch counts instead of num_epochs so that an oversized
             # num_epochs (e.g. 999) does not trap the schedule in warm-up forever.
@@ -386,16 +388,15 @@ class PCVRHyFormerRankingTrainer:
             loss_sum = 0.0
 
             for step, batch in train_pbar:
+                total_step += 1
                 loss_dict = self._train_step(batch)
                 loss = loss_dict['total']
-                total_step += 1
-                loss_sum += loss
 
                 # Step LR scheduler after each optimizer step (dense only).
                 if self.dense_scheduler is not None:
                     self.dense_scheduler.step()
 
-                if self.writer:
+                if self.writer and total_step % self.tb_log_every_n_steps == 0:
                     self.writer.add_scalar('Loss/Total', loss, total_step)
                     self.writer.add_scalar('LR/Dense', self.dense_optimizer.param_groups[0]['lr'], total_step)
                     if self.sparse_optimizer is not None:
@@ -408,10 +409,6 @@ class PCVRHyFormerRankingTrainer:
                         self.writer.add_scalar('Loss/PairwiseHingeLoss', loss_dict['rank'], total_step)
                     if 'info' in loss_dict:
                         self.writer.add_scalar('Loss/InfoNCELoss', loss_dict['info'], total_step)
-                    if 'dense_grad_norm' in loss_dict:
-                        self.writer.add_scalar('GradNorm/Dense', loss_dict['dense_grad_norm'], total_step)
-                    if 'sparse_grad_norm' in loss_dict:
-                        self.writer.add_scalar('GradNorm/Sparse', loss_dict['sparse_grad_norm'], total_step)
 
                 postfix = {
                     "loss": f"{loss:.4f}",
@@ -460,18 +457,6 @@ class PCVRHyFormerRankingTrainer:
                 self.writer.add_scalar('Calibration/Validation', val_calibration, total_step)
 
             self._handle_validation_result(total_step, val_auc, val_logloss)
-
-            # Log sparse embedding weight statistics once per epoch.
-            if self.writer and self.sparse_optimizer is not None:
-                emb_norm_mean = 0.0
-                emb_count = 0
-                for p in self.model.get_sparse_params():
-                    # Vector-wise L2 norm per embedding row, then average over vocab.
-                    norms = p.data.norm(p=2, dim=1)
-                    emb_norm_mean += norms.mean().item()
-                    emb_count += 1
-                if emb_count > 0:
-                    self.writer.add_scalar('Sparse/EmbeddingMeanNorm', emb_norm_mean / emb_count, total_step)
 
             if self.early_stopping.early_stop:
                 logging.info(f"Early stopping at epoch {epoch}")
@@ -542,8 +527,8 @@ class PCVRHyFormerRankingTrainer:
         # loss_mask: True for "new" rows, False for overlapped rows.
         # Overlapped rows participate in InfoNCE but are excluded from
         # BCE / Pair / Focal to avoid duplicate gradient signals.
+        # When overlap=0, loss_mask is all-True (identity).
         loss_mask = device_batch.get('loss_mask', torch.ones_like(label, dtype=torch.bool))
-        sample_weight = device_batch.get('sample_weight', torch.ones_like(label))
 
         self.dense_optimizer.zero_grad()
         if self.sparse_optimizer is not None:
@@ -561,26 +546,12 @@ class PCVRHyFormerRankingTrainer:
         # Masked logits/labels for losses that should ignore overlap rows.
         valid_logits = logits[loss_mask]
         valid_label = label[loss_mask]
-        valid_weight = sample_weight[loss_mask]
 
         loss = torch.tensor(0.0, device=logits.device)
         loss_dict = {}
 
         if 'bce' in self.parsed_losses:
-            # Dynamic pos_weight based on the actual pos/neg ratio in valid rows.
-            pos_count = valid_label.sum().float()
-            neg_count = (~valid_label.bool()).sum().float()
-            pos_weight_val = torch.sqrt(neg_count / max(pos_count, 1.0))
-            per_sample_weight = torch.where(
-                valid_label == 1, pos_weight_val, torch.tensor(1.0, device=valid_label.device)
-            )
-            # Renormalise so that the weighted mean stays in a stable range.
-            per_sample_weight = per_sample_weight / max(per_sample_weight.sum(), 1.0) * valid_label.numel()
-
-            bce_per_sample = F.binary_cross_entropy_with_logits(
-                valid_logits, valid_label, reduction='none'
-            )
-            bce_loss = (bce_per_sample * per_sample_weight).mean()
+            bce_loss = F.binary_cross_entropy_with_logits(valid_logits, valid_label)
             loss = loss + self.bce_weight * bce_loss
             loss_dict['bce'] = bce_loss
 
@@ -627,24 +598,6 @@ class PCVRHyFormerRankingTrainer:
 
         loss.backward()
 
-        # Compute per-group grad norms before clipping (for TensorBoard).
-        dense_grad_norm = 0.0
-        sparse_grad_norm = 0.0
-        if hasattr(self.model, 'get_sparse_params'):
-            for p in self.model.get_dense_params():
-                if p.grad is not None:
-                    dense_grad_norm += p.grad.data.norm(2).item() ** 2
-            for p in self.model.get_sparse_params():
-                if p.grad is not None:
-                    sparse_grad_norm += p.grad.data.norm(2).item() ** 2
-            dense_grad_norm = dense_grad_norm ** 0.5
-            sparse_grad_norm = sparse_grad_norm ** 0.5
-        else:
-            for p in self.model.parameters():
-                if p.grad is not None:
-                    dense_grad_norm += p.grad.data.norm(2).item() ** 2
-            dense_grad_norm = dense_grad_norm ** 0.5
-
         # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
         # with certain tensor shapes in this project.
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
@@ -652,9 +605,6 @@ class PCVRHyFormerRankingTrainer:
         self.dense_optimizer.step()
         if self.sparse_optimizer is not None:
             self.sparse_optimizer.step()
-
-        loss_dict['dense_grad_norm'] = dense_grad_norm
-        loss_dict['sparse_grad_norm'] = sparse_grad_norm
 
         # Convert to Python floats for return
         return {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in loss_dict.items()}

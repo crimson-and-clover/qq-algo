@@ -409,7 +409,6 @@ class PCVRParquetDataset(IterableDataset):
             if self.overlap > 0 and i > 0:
                 loss_mask[:self.overlap] = False
             batch['loss_mask'] = loss_mask
-            batch['sample_weight'] = loss_mask.float()
             yield batch
         del merged
         buffer.clear()
