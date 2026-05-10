@@ -244,6 +244,10 @@ def parse_args() -> argparse.Namespace:
                         help='Enable Target-Attention in QueryGenerator. '
                              'If set, item-side NS tokens are used as query '
                              'to attend over each sequence instead of MeanPool.')
+    parser.add_argument('--use_feature_interaction', action='store_true', default=True,
+                        help='Append user ⊙ item element-wise interaction to the '
+                             'classifier input (default True). Disable to revert to '
+                             'the original single-tower classifier.')
 
     args = parser.parse_args()
 
@@ -360,6 +364,7 @@ def main() -> None:
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
         "use_target_attention": args.use_target_attention,
+        "use_feature_interaction": args.use_feature_interaction,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)

@@ -16,6 +16,7 @@ class ModelInput(NamedTuple):
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+    seq_time_diffs: dict   # {domain: tensor [B, L]}, continuous seconds
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1275,6 +1276,8 @@ class PCVRHyFormer(nn.Module):
         item_ns_tokens: int = 0,
         # QueryGenerator variant
         use_target_attention: bool = False,
+        # Classifier variant
+        use_feature_interaction: bool = True,
     ) -> None:
         super().__init__()
 
@@ -1423,6 +1426,12 @@ class PCVRHyFormer(nn.Module):
         if num_time_buckets > 0:
             self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
 
+        # ================== Time-decay learnable tau per domain ==================
+        self._time_tau = nn.ParameterDict({
+            domain: nn.Parameter(torch.tensor(86400.0))  # init = 1 day in seconds
+            for domain in self.seq_domains
+        }) if num_time_buckets > 0 else nn.ParameterDict()
+
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator
         self.query_generator = MultiSeqQueryGenerator(
@@ -1459,6 +1468,8 @@ class PCVRHyFormer(nn.Module):
         else:
             self.rotary_emb = None
 
+        self.use_feature_interaction = use_feature_interaction
+
         # Output projection
         self.output_proj = nn.Sequential(
             nn.Linear(num_queries * self.num_sequences * d_model, d_model),
@@ -1469,8 +1480,9 @@ class PCVRHyFormer(nn.Module):
         self.emb_dropout = nn.Dropout(dropout_rate)
 
         # Classifier
+        clf_input_dim = d_model * 2 if use_feature_interaction else d_model
         self.clsfier = nn.Sequential(
-            nn.Linear(d_model, d_model),
+            nn.Linear(clf_input_dim, d_model),
             nn.LayerNorm(d_model),
             nn.SiLU(),
             nn.Dropout(dropout_rate),
@@ -1591,11 +1603,13 @@ class PCVRHyFormer(nn.Module):
     def _embed_seq_domain(
         self,
         seq: torch.Tensor,
+        domain: str,
         sideinfo_embs: nn.ModuleList,
         proj: nn.Module,
         is_id: List[bool],
         emb_index: List[int],
         time_bucket_ids: torch.Tensor,
+        time_diffs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Embeds a sequence domain by concatenating sideinfo embeddings and projecting to d_model."""
         B, S, L = seq.shape
@@ -1617,6 +1631,13 @@ class PCVRHyFormer(nn.Module):
         # Add time bucket embedding (all-zero ids produce zero vectors via padding_idx=0)
         if self.num_time_buckets > 0:
             token_emb = token_emb + self.time_embedding(time_bucket_ids)
+
+        # Continuous time-decay gating: recency-weighted suppression of old positions.
+        # weight = 1 / (1 + time_diff / tau), tau learnable per domain.
+        if time_diffs is not None and self.num_time_buckets > 0:
+            tau = self._time_tau[domain].clamp(min=1.0)  # (scalar)
+            w = 1.0 / (1.0 + time_diffs.float().unsqueeze(-1) / tau)
+            token_emb = token_emb * w
 
         return token_emb
 
@@ -1710,9 +1731,11 @@ class PCVRHyFormer(nn.Module):
         for domain in self.seq_domains:
             tokens = self._embed_seq_domain(
                 inputs.seq_data[domain],
+                domain,
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                inputs.seq_time_diffs.get(domain))
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
@@ -1729,10 +1752,16 @@ class PCVRHyFormer(nn.Module):
             apply_dropout=self.training
         )
 
+        # User ⊙ Item interaction (element-wise, low-cost)
+        if self.use_feature_interaction:
+            interaction = user_ns.mean(dim=1) * item_ns.mean(dim=1)  # (B, D)
+            output = torch.cat([output, interaction], dim=-1)        # (B, 2*D)
+
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
         if return_embedding:
-            return logits, output
+            # Return the pre-interaction representation for InfoNCE
+            return logits, output[:, :self.d_model]
         return logits
 
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1757,9 +1786,11 @@ class PCVRHyFormer(nn.Module):
         for domain in self.seq_domains:
             tokens = self._embed_seq_domain(
                 inputs.seq_data[domain],
+                domain,
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                inputs.seq_time_diffs.get(domain))
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
@@ -1773,6 +1804,10 @@ class PCVRHyFormer(nn.Module):
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=False
         )
+
+        if self.use_feature_interaction:
+            interaction = user_ns.mean(dim=1) * item_ns.mean(dim=1)
+            output = torch.cat([output, interaction], dim=-1)
 
         logits = self.clsfier(output)
         return logits, output

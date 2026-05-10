@@ -611,42 +611,60 @@ class PCVRParquetDataset(IterableDataset):
             '_seq_domains': self.seq_domains,
         }
 
-        # ---- Sequence features: fused padding directly into the 3D buffer ----
+        # ---- Sequence features: log-spaced sampling into 3D buffer ----
         for domain in self.seq_domains:
             max_len = self._seq_maxlen[domain]
             side_plan, ts_ci = self._seq_plan[domain]
 
-            # Write directly into the pre-allocated 3D buffer.
             out = self._buf_seq[domain][:B]
             out[:] = 0
             lengths = self._buf_seq_lens[domain][:B]
             lengths[:] = 0
 
-            # Fused path: first collect (offsets, values, vocab_size, col_idx)
-            # for every side-info column, then fill the buffer in a single pass.
             col_data = []
             for ci, slot, vs in side_plan:
                 col = batch.column(ci)
                 col_data.append((col.offsets.to_numpy(), col.values.to_numpy(), vs, ci))
 
+            # Compute log-spaced sampling indices per row (once per domain).
+            ref_offs = col_data[0][0]
+            dense_k = max_len // 2
+            sparse_k = max_len - dense_k
+            sampling_idx = np.zeros((B, max_len), dtype=np.int64)
+
+            for i in range(B):
+                s = int(ref_offs[i])
+                e = int(ref_offs[i + 1])
+                rl = e - s
+                if rl <= 0:
+                    continue
+                if rl <= max_len:
+                    sampling_idx[i, :rl] = np.arange(rl)
+                    lengths[i] = rl
+                else:
+                    sampling_idx[i, :dense_k] = np.arange(dense_k)
+                    remaining = rl - dense_k
+                    stride = max(1, remaining // sparse_k)
+                    sparse_pos = np.arange(dense_k, rl, stride)[:sparse_k]
+                    n_sparse = len(sparse_pos)
+                    sampling_idx[i, dense_k:dense_k + n_sparse] = sparse_pos
+                    lengths[i] = max_len
+
+            # Fill side-info columns using sampling indices.
             for c, (offs, vals, vs, ci) in enumerate(col_data):
                 for i in range(B):
                     s = int(offs[i])
                     e = int(offs[i + 1])
-                    rl = e - s
-                    if rl <= 0:
+                    if e - s <= 0:
                         continue
-                    ul = min(rl, max_len)
-                    out[i, c, :ul] = vals[s:s + ul]
-                    if ul > lengths[i]:
-                        lengths[i] = ul
+                    idx = sampling_idx[i]
+                    out[i, c, :] = vals[s + idx]
 
-            # Values <= 0 -> 0.
             out[out <= 0] = 0
+            # Zero-out padding tail for short sequences (rl < max_len)
+            tail_mask = (np.arange(max_len) < lengths[:, np.newaxis]).astype(np.int64)
+            out *= tail_mask[:, np.newaxis, :]
 
-            # Check out-of-bound values per feature's vocab_size.
-            # vs==0 means no vocab info; force the whole slice to 0 so that
-            # the model's 1-slot Embedding is never indexed out of range.
             for c, (_, _, vs, ci) in enumerate(col_data):
                 slice_c = out[:, c, :]
                 if vs > 0:
@@ -657,35 +675,29 @@ class PCVRParquetDataset(IterableDataset):
             result[domain] = torch.from_numpy(out.copy())
             result[f'{domain}_len'] = torch.from_numpy(lengths.copy())
 
-            # Time bucketing.
+            # Time bucketing + continuous time_diff stored for model-side decay.
             time_bucket = self._buf_seq_tb[domain][:B]
             time_bucket[:] = 0
+            ts_padded = np.zeros((B, max_len), dtype=np.int64)
+            time_diff_cont = np.zeros((B, max_len), dtype=np.float32)  # continuous seconds
+
             if ts_ci is not None:
                 ts_col = batch.column(ts_ci)
                 ts_offs = ts_col.offsets.to_numpy()
                 ts_vals = ts_col.values.to_numpy()
-                # Pad timestamps into shape (B, max_len).
-                ts_padded = np.zeros((B, max_len), dtype=np.int64)
                 for i in range(B):
                     s = int(ts_offs[i])
                     e = int(ts_offs[i + 1])
-                    rl = e - s
-                    if rl <= 0:
+                    if e - s <= 0:
                         continue
-                    ul = min(rl, max_len)
-                    ts_padded[i, :ul] = ts_vals[s:s + ul]
+                    idx = sampling_idx[i]
+                    ts_padded[i, :] = ts_vals[s + idx]
+                # Zero tail for short sequences (same as side-info fix)
+                ts_padded *= (np.arange(max_len) < lengths[:, np.newaxis]).astype(np.int64)
 
                 ts_expanded = timestamps.reshape(-1, 1)
                 time_diff = np.maximum(ts_expanded - ts_padded, 0)
-                # np.searchsorted returns values in [0, len(BUCKET_BOUNDARIES)].
-                # After +1 the nominal range is [1, len(BUCKET_BOUNDARIES)+1];
-                # the upper bound only appears when time_diff exceeds the
-                # largest boundary (~1 year) and would index past
-                # nn.Embedding(NUM_TIME_BUCKETS=len(BUCKET_BOUNDARIES)+1).
-                # Clip raw result to [0, len(BUCKET_BOUNDARIES)-1] so the final
-                # bucket id (after +1) stays within [1, len(BUCKET_BOUNDARIES)]
-                # and is always a valid Embedding index. Time-diffs beyond the
-                # largest boundary collapse into the last bucket.
+                time_diff_cont[:] = time_diff
                 raw_buckets = np.clip(
                     np.searchsorted(BUCKET_BOUNDARIES, time_diff.ravel()),
                     0, len(BUCKET_BOUNDARIES) - 1,
@@ -695,6 +707,7 @@ class PCVRParquetDataset(IterableDataset):
                 time_bucket[:] = buckets
 
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
+            result[f'{domain}_time_diff'] = torch.from_numpy(time_diff_cont.copy())
 
         return result
 
