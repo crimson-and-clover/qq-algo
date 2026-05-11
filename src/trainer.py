@@ -595,7 +595,7 @@ class PCVRHyFormerRankingTrainer:
         if 'info' in self.parsed_losses:
             # InfoNCE uses the FULL batch (including overlap rows) to maximise
             # the negative sample pool.
-            info_loss = supervised_infonce(emb, label, tau=self.info_tau)
+            info_loss = supervised_infonce(emb, label, tau=self.info_tau, mode='uniformity')
             loss = loss + self.info_weight * info_loss
             loss_dict['info'] = info_loss
 

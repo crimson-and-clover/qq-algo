@@ -291,34 +291,57 @@ def sigmoid_focal_loss(
 def supervised_infonce(
     emb: torch.Tensor,
     labels: torch.Tensor,
-    tau: float = 0.07,
+    tau: float = 0.15,
+    mode: str = 'uniformity',
 ) -> torch.Tensor:
-    """Supervised InfoNCE: same-label pairs are positives, cross-label are negatives.
+    """Supervised InfoNCE with two modes.
+
+    ``mode='uniformity'`` (default, recommended):
+        Self is the only positive — every other sample in the batch is a
+        negative.  This encourages embeddings to spread uniformly on the
+        hypersphere, which acts as a lightweight diversity regulariser that
+        prevents collapse without imposing any semantically-questionable
+        positive pairs (no label/ user/ item grouping).
+
+        Equivalent to the InfoNCE formulation:
+            L = -log( exp(1/τ) / Σ_j exp(sim_ij / τ) )
+              = logsumexp(sim) − 1/τ
+
+        Only the logsumexp term carries a gradient, so we minimise that.
+
+    ``mode='label'``:
+        Same-label pairs are positives (original behaviour).  MUST be
+        combined with a projection head (``model.info_proj``) to isolate
+        the contrastive space from the backbone.
 
     Args:
-        emb: (B, D) hidden representations.
-        labels: (B,) binary labels {0, 1}.
-        tau: temperature coefficient.
+        emb: (B, D) representations (from ``model.info_proj`` when
+            mode='label').
+        labels: (B,) binary labels {0, 1}.  Ignored when mode='uniformity'.
+        tau: temperature (default 0.15).
+        mode: 'uniformity' | 'label'.
+
     Returns:
-        scalar loss tensor.
+        Scalar loss tensor.
     """
     B = emb.shape[0]
-    # L2 normalize so that dot product equals cosine similarity
     emb = F.normalize(emb, p=2, dim=1)
-    # (B, B) similarity matrix scaled by temperature
     sim = torch.matmul(emb, emb.t()) / tau
-    # Mask out self-similarity
-    sim = sim.masked_fill(torch.eye(B, device=emb.device).bool(), -1e9)
 
-    # Positive mask: same label, excluding diagonal
-    pos_mask = (labels.unsqueeze(1) == labels.unsqueeze(0)).float()
-    pos_mask = pos_mask - torch.eye(B, device=emb.device)
+    if mode == 'uniformity':
+        # Self is the only positive → loss = logsumexp(sim_j) − 1/τ.
+        # The −1/τ term is gradient-free, so we minimise logsumexp directly.
+        loss = torch.logsumexp(sim, dim=1).mean()
+    else:
+        sim = sim.masked_fill(torch.eye(B, device=emb.device).bool(), -1e9)
+        pos_mask = (labels.unsqueeze(1) == labels.unsqueeze(0)).float()
+        pos_mask = pos_mask - torch.eye(B, device=emb.device)
+        exp_sim = torch.exp(sim)
+        numerator = (exp_sim * pos_mask).sum(dim=1)
+        denominator = exp_sim.sum(dim=1)
+        has_pos = pos_mask.sum(dim=1) > 0
+        if has_pos.sum() == 0:
+            return torch.tensor(0.0, device=emb.device)
+        loss = -torch.log(numerator[has_pos] / denominator[has_pos] + 1e-8).mean()
 
-    exp_sim = torch.exp(sim)
-    numerator = (exp_sim * pos_mask).sum(dim=1)
-    denominator = exp_sim.sum(dim=1)
-
-    has_pos = pos_mask.sum(dim=1) > 0
-    if has_pos.sum() == 0:
-        return torch.tensor(0.0, device=emb.device)
-    return -torch.log(numerator[has_pos] / denominator[has_pos] + 1e-8).mean()
+    return loss

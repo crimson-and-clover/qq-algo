@@ -286,6 +286,7 @@ def _batch_to_model_input(
     seq_data: Dict[str, torch.Tensor] = {}
     seq_lens: Dict[str, torch.Tensor] = {}
     seq_time_buckets: Dict[str, torch.Tensor] = {}
+    seq_time_diffs: Dict[str, torch.Tensor] = {}
     for domain in seq_domains:
         seq_data[domain] = device_batch[domain]
         seq_lens[domain] = device_batch[f'{domain}_len']
@@ -293,6 +294,9 @@ def _batch_to_model_input(
         seq_time_buckets[domain] = device_batch.get(
             f'{domain}_time_bucket',
             torch.zeros(B, L, dtype=torch.long, device=device))
+        seq_time_diffs[domain] = device_batch.get(
+            f'{domain}_time_diff',
+            torch.zeros(B, L, dtype=torch.float32, device=device))
 
     return ModelInput(
         user_int_feats=device_batch['user_int_feats'],
@@ -302,6 +306,7 @@ def _batch_to_model_input(
         seq_data=seq_data,
         seq_lens=seq_lens,
         seq_time_buckets=seq_time_buckets,
+        seq_time_diffs=seq_time_diffs,
     )
 
 

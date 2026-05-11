@@ -544,6 +544,7 @@ class PCVRParquetDataset(IterableDataset):
         else:
             labels = np.zeros(B, dtype=np.int64)
         user_ids = batch.column(self._col_idx['user_id']).to_pylist()
+        item_ids = batch.column(self._col_idx['item_id']).to_pylist()
 
         # ---- user_int: write into pre-allocated buffer ----
         # Note: null -> 0 (via fill_null), -1 -> 0 (via arr<=0); missing values
@@ -608,6 +609,7 @@ class PCVRParquetDataset(IterableDataset):
             'label': torch.from_numpy(labels),
             'timestamp': torch.from_numpy(timestamps),
             'user_id': user_ids,
+            'item_id': item_ids,
             '_seq_domains': self.seq_domains,
         }
 

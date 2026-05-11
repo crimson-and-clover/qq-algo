@@ -163,8 +163,9 @@ def parse_args() -> argparse.Namespace:
                              '(effective only when pair is in loss_type, default 1.0)')
     parser.add_argument('--info_weight', type=float, default=1.0,
                         help='Weight for InfoNCE term (default 1.0)')
-    parser.add_argument('--info_tau', type=float, default=0.07,
-                        help='Temperature for InfoNCE (default 0.07)')
+    parser.add_argument('--info_tau', type=float, default=0.15,
+                        help='Temperature for InfoNCE (default 0.15, raised from 0.07 '
+                             'to soften clustering when label-based positives are used)')
 
     # Sparse optimizer.
     parser.add_argument('--sparse_lr', type=float, default=0.05,

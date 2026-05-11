@@ -1760,7 +1760,6 @@ class PCVRHyFormer(nn.Module):
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
         if return_embedding:
-            # Return the pre-interaction representation for InfoNCE
             return logits, output[:, :self.d_model]
         return logits
 
