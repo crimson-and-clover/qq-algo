@@ -112,74 +112,133 @@
 
 ---
 
-## 实验 3（可选）：Focal Loss
+## 实验 C：Focal Loss（不改模型，只换 loss）
 
 **日期**：
 
-### 修改内容
+### 修改
 
 ```bash
-# run.sh 中替换
---loss_type bce+info    →  --loss_type focal+info
-# 或混合
---loss_type bce+focal+info --bce_weight 0.5 --focal_weight 0.5
+# run.sh 改 1 行
+--loss_type bce+info  →  --loss_type focal+info
 ```
 
-### 预期结果
+### 原理
 
-- 1:9 正负比下，Focal Loss 自动降权简单负样本
-- LogLoss 可能略涨（Focal 不直接优化 logloss），但 AUC 应提升
+正负比 1:9，BCE 同等对待所有样本。Focal Loss 自动降权简单负样本（gamma=2），让模型专注困难样本。
+
+### 预期
+
+| 指标 | 实验 B | 预期实验 C |
+|------|--------|-----------|
+| AUC | B 的基线 | **+0.5–1.0** |
+| LogLoss | — | 可能微涨（Focal 不直接优化 logloss） |
 
 ### 实际结果
 
-| 配置 | AUC | LogLoss | 备注 |
-|------|-----|---------|------|
-| focal+info | | | |
-| bce+focal+info | | | |
+| Epoch | AUC | LogLoss | 备注 |
+|-------|-----|---------|------|
+| 1 | | | |
+| best | | | |
 
 ---
 
-## 实验 4（可选）：关闭时间衰减门控
+## 实验 D：LongerEncoder 单独加（无时间衰减）
 
 **日期**：
 
-### 修改内容
+### 修改
 
-需在 `model.py` 加 flag 或在 dataset 中将 `time_diff` 全置 0。
+```bash
+# run.sh 加 3 行（在实验 C 基础上）
+--seq_encoder_type longer \
+--seq_top_k 256 \
+--seq_max_lens seq_a:1024,seq_b:1024,seq_c:1024,seq_d:2048 \
+```
 
-### 预期结果
+### 原理
 
-- 若时间衰减过度压制远期数据，关闭后 AUC 可能恢复
-- 若门控有效，AUC 可能下降
+模型结构回 baseline 后，序列截断又回到了 13% 利用率。LongerEncoder 的 top-K cross-attention 允许 4x 长序列而不 O(n²)。这次**不带时间衰减**，避免旧数据被压死。
+
+### 预期
+
+| 指标 | 实验 C | 预期实验 D |
+|------|--------|-----------|
+| AUC | C 的基线 | **+1.0–2.0** |
+| 序列利用率 | 13% | **~60%** |
+| 显存 | — | +2x（若 OOM 先降 seq_d 到 1024） |
 
 ### 实际结果
 
-| 配置 | AUC | 备注 |
-|------|-----|------|
-| 关闭 time_decay | | |
+| Epoch | AUC | LogLoss | 显存峰值 | 备注 |
+|-------|-----|---------|---------|------|
+| 1 | | | | |
+| best | | | | |
 
 ---
 
-## 实验 5（可选）：关闭 RoPE / user-item interaction
+## 实验 E：ns_groups.json + GroupNSTokenizer
 
-### 修改内容
+**日期**：
+
+### 修改
 
 ```bash
-# 删 --use_rope
-# 加 --no_feature_interaction
+# run.sh 改 2 行
+--ns_tokenizer_type group \
+--ns_groups_json "${SCRIPT_DIR}/ns_groups.json" \
+--num_queries 1 \
 ```
 
-### 预期结果
+### 原理
 
-逐个消融，确认每个新特性对 AUC 的贡献方向和量级。
+ns_groups.json 将 46 个 user fids 按语义分为 7 组（用户属性/行为/上下文）、14 个 item fids 分为 4 组（商品类型/质量/属性）。GroupNSTokenizer 每组投影到 1 个 token（共 12 个），比 RankMixer 的 5+2 个 token 信息损失更小，且保留了分组语义。
+
+注意：`num_queries` 需改为 1 满足 `d_model % T == 0`（T = 1*4 + 12 = 16）。
+
+### 预期
+
+| 指标 | 实验 D | 预期实验 E |
+|------|--------|-----------|
+| AUC | D 的基线 | **±0.5**（不确定方向） |
 
 ### 实际结果
 
-| 配置 | AUC | 备注 |
-|------|-----|------|
-| 无 RoPE | | |
-| 无 interaction | | |
-| 两者都无 | | |
+| Epoch | AUC | 备注 |
+|-------|-----|------|
+| 1 | | |
+| best | | |
+
+---
+
+## 实验 F：RankMixer 压缩比降低
+
+**日期**：
+
+### 修改
+
+```bash
+# 在实验 D 基础上，保持 rankmixer 但提高 token 数
+--user_ns_tokens 8 \
+--item_ns_tokens 4 \
+```
+
+### 原理
+
+当前 RankMixer 把 46 user fids + 1 dense = 47 个 embedding 压缩到 5 个 token，压缩比 9:1。加大到 8+4=12 token 后压缩比降到 ~4:1，信息损失减小。需要验证 `d_model % T == 0`（T = num_queries*4 + 8+1+4+0，实际值依 num_queries 而定）。
+
+### 预期
+
+| 指标 | 实验 D | 预期实验 F |
+|------|--------|-----------|
+| AUC | D 的基线 | **+0.3–0.5** |
+
+### 实际结果
+
+| Epoch | AUC | 备注 |
+|-------|-----|------|
+| 1 | | |
+| best | | |
 
 ---
 
