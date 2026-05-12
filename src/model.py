@@ -1632,12 +1632,14 @@ class PCVRHyFormer(nn.Module):
         if self.num_time_buckets > 0:
             token_emb = token_emb + self.time_embedding(time_bucket_ids)
 
-        # Continuous time-decay gating: recency-weighted suppression of old positions.
-        # weight = 1 / (1 + time_diff / tau), tau learnable per domain.
-        if time_diffs is not None and self.num_time_buckets > 0:
-            tau = self._time_tau[domain].clamp(min=1.0)  # (scalar)
-            w = 1.0 / (1.0 + time_diffs.float().unsqueeze(-1) / tau)
-            token_emb = token_emb * w
+        # [DISABLED] Continuous time-decay gating — suppressed old tokens' signal,
+        # which combined with head-biased log-spaced sampling left the model with
+        # near-zero effective sequence input.  Re-enable after fixing sampling to
+        # include recent (tail) positions.
+        # if time_diffs is not None and self.num_time_buckets > 0:
+        #     tau = self._time_tau[domain].clamp(min=1.0)  # (scalar)
+        #     w = 1.0 / (1.0 + time_diffs.float().unsqueeze(-1) / tau)
+        #     token_emb = token_emb * w
 
         return token_emb
 

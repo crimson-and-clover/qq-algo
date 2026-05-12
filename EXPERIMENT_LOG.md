@@ -73,30 +73,42 @@
 
 ---
 
+## 实验 B：回退 baseline 结构（关时间衰减/LongerEncoder/target_attention/interaction/RoPE）
+
 **日期**：
 
 ### 修改内容
 
-| 项 | 改前 | 改后 |
-|----|------|------|
-| seq_encoder_type | transformer（默认） | longer |
-| seq_top_k | — | 256 |
-| seq_max_lens | seq_a:256, seq_b:256, seq_c:512, seq_d:512 | seq_a:1024, seq_b:1024, seq_c:1024, seq_d:2048 |
+| 项 | 实验 1 | 实验 B |
+|----|--------|--------|
+| seq_encoder_type | longer | **transformer**（=baseline） |
+| seq_max_lens | 1024-2048 | **默认 256-512**（=baseline） |
+| time-decay gating | 启用 | **禁用**（model.py 注释掉） |
+| use_target_attention | 无→实验A有 | **关闭**（=baseline） |
+| use_feature_interaction | True | **False**（train.py 改默认） |
+| use_rope | True | **False**（=baseline） |
+| dropout_rate | 0.05 | **0.01**（=baseline） |
+| dense_weight_decay | 0.01 | **0**（=baseline） |
+| InfoNCE uniformity | ✅ 保留 | ✅ 保留 |
+| warmup+cosine | ✅ 保留 | ✅ 保留 |
+
+> 仅保留两个已验证有效的改进：InfoNCE uniformity + LR scheduler。其他全部回退到 baseline_code 等价。
 
 ### 预期结果
 
-- 序列信息利用率 ~13% → ~60%
-- AUC 应再提升 0.5–1.0 个点
-- 训练速度略降（cross-attn O(kL) vs 原 self-attn O(L²)，但 L 翻 4x）
-- 若 OOM：先降 `seq_d` 到 1024
+| 指标 | 实验 1 val | 实验 1 test | 预期实验 B |
+|------|-----------|------------|-----------|
+| AUC | 0.841 | 0.782 | **≥ 0.86** |
+| LogLoss | 0.244→0.275↑ | — | 平稳 |
+| InfoNCE | 7.1 | — | 7-8 稳定 |
 
 ### 实际结果
 
-| Epoch | AUC | LogLoss | 显存峰值 | 备注 |
-|-------|-----|---------|---------|------|
-| 1 | | | | |
-| 2 | | | | |
-| best | | | | |
+| Epoch | 步数 | AUC | LogLoss | InfoNCE | 备注 |
+|-------|------|-----|---------|---------|------|
+| 1 | | | | | |
+| 2 | | | | | |
+| best | | | | | |
 
 ---
 

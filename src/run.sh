@@ -9,10 +9,10 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 #     "$@"
 
 # ---- Mode: training (default) ----
-# RankMixer NS tokenizer + BCE + InfoNCE(uniformity) + LongerEncoder
-# Scheduler: 1-epoch warmup (~4k steps, ~10%) + cosine over 10 epochs (~40k steps)
-# LongerEncoder: top-K cross-attention compresses sequences to 256 tokens,
-# allowing 4x longer input sequences vs baseline without O(n²) explosion.
+# Baseline model structure (transformer, no time-decay, no target_attention)
+# + InfoNCE uniformity (防表征坍缩) + warmup+cosine scheduler
+# 回退序列 encoder/seq_max_lens/dropout/wd 到 baseline 值，
+# 仅保留已验证有效的 InfoNCE 修复和 LR schedule。
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
     --user_ns_tokens 5 \
@@ -20,17 +20,10 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --num_queries 2 \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
-    --num_workers 4 \
-    --seq_encoder_type longer \
-    --seq_top_k 256 \
-    --seq_max_lens seq_a:1024,seq_b:1024,seq_c:1024,seq_d:2048 \
+    --num_workers 8 \
     --warmup_epochs 1 \
     --cosine_t_max_epochs 10 \
     --min_lr_ratio 0.1 \
-    --dropout_rate 0.05 \
-    --dense_weight_decay 0.01 \
-    --use_rope \
-    --use_target_attention \
     --loss_type bce+info \
     --bce_weight 1.0 \
     --info_weight 0.05 \

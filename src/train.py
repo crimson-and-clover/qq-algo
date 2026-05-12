@@ -245,9 +245,9 @@ def parse_args() -> argparse.Namespace:
                         help='Enable Target-Attention in QueryGenerator. '
                              'If set, item-side NS tokens are used as query '
                              'to attend over each sequence instead of MeanPool.')
-    parser.add_argument('--use_feature_interaction', action='store_true', default=True,
+    parser.add_argument('--use_feature_interaction', action='store_true', default=False,
                         help='Append user ⊙ item element-wise interaction to the '
-                             'classifier input (default True). Disable to revert to '
+                             'classifier input (default False, matching baseline).')
                              'the original single-tower classifier.')
 
     args = parser.parse_args()
