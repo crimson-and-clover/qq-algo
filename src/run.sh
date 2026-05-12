@@ -20,7 +20,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --num_queries 2 \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
-    --num_workers 8 \
+    --num_workers 4 \
     --seq_encoder_type longer \
     --seq_top_k 256 \
     --seq_max_lens seq_a:1024,seq_b:1024,seq_c:1024,seq_d:2048 \
@@ -30,6 +30,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --dropout_rate 0.05 \
     --dense_weight_decay 0.01 \
     --use_rope \
+    --use_target_attention \
     --loss_type bce+info \
     --bce_weight 1.0 \
     --info_weight 0.05 \

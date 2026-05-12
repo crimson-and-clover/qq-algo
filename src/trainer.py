@@ -476,6 +476,10 @@ class PCVRHyFormerRankingTrainer:
                         if p.data_ptr() in self.sparse_optimizer.state:
                             old_state[p.data_ptr()] = self.sparse_optimizer.state[p]
 
+                # Free old optimizer before reinit to avoid holding extra GPU memory
+                # while the new optimizer allocates its own Adagrad state buffers.
+                del self.sparse_optimizer
+
                 reinit_ptrs = self.model.reinit_high_cardinality_params(self.reinit_cardinality_threshold)
                 sparse_params = self.model.get_sparse_params()
                 self.sparse_optimizer = torch.optim.Adagrad(
@@ -489,6 +493,12 @@ class PCVRHyFormerRankingTrainer:
                         restored += 1
                 logging.info(f"Rebuilt Adagrad optimizer after epoch {epoch}, "
                              f"restored optimizer state for {restored} low-cardinality params")
+
+                # Release old_state references and free cached GPU memory before
+                # next epoch starts (avoids OOM from stale allocations + new
+                # DataLoader batch prefetch).
+                del old_state
+                torch.cuda.empty_cache()
 
     def _make_model_input(self, device_batch: Dict[str, Any]) -> ModelInput:
         """Construct a ``ModelInput`` NamedTuple from a device_batch dict."""
