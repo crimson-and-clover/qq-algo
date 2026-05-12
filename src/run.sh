@@ -8,11 +8,9 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 # python3 -u "${SCRIPT_DIR}/data_explorer.py" \
 #     "$@"
 
-# ---- Mode: training (default) ----
-# Baseline model structure (transformer, no time-decay, no target_attention)
-# + InfoNCE uniformity (防表征坍缩) + warmup+cosine scheduler
-# 回退序列 encoder/seq_max_lens/dropout/wd 到 baseline 值，
-# 仅保留已验证有效的 InfoNCE 修复和 LR schedule。
+# ---- Experiment B: 纯 baseline 等价对照 ----
+# 仅保留绝对一致的修改：无 log-spaced 采样，无 InfoNCE，无 scheduler。
+# 确认是否能回到 baseline AUC 0.86。
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
     --user_ns_tokens 5 \
@@ -21,13 +19,8 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \
-    --warmup_epochs 1 \
-    --cosine_t_max_epochs 10 \
-    --min_lr_ratio 0.1 \
-    --loss_type bce+info \
-    --bce_weight 1.0 \
-    --info_weight 0.05 \
-    --info_tau 0.15 \
+    --no_scheduler \
+    --loss_type bce \
     "$@"
 
 # ---- Legacy config: BCE + Pairwise Hinge ----
