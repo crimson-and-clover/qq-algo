@@ -248,7 +248,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--use_feature_interaction', action='store_true', default=False,
                         help='Append user ⊙ item element-wise interaction to the '
                              'classifier input (default False, matching baseline).')
-                             'the original single-tower classifier.')
 
     args = parser.parse_args()
 
