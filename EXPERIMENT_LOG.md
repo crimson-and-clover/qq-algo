@@ -133,13 +133,12 @@
 
 ### 实际结果（Job: exp_b_zero_diff / 第三次提交，全部修复）
 
-| Epoch | AUC (val) | AUC (test) | LogLoss | 备注 |
-|-------|-----------|------------|---------|------|
-| 1 | | | | |
-| 2 | | | | |
-| best | | | | |
+| Step | AUC (val) | LogLoss | 备注 |
+|------|-----------|---------|------|
+| 3624 | **0.857** | — | 符合 baseline 预期 |
 
-> **等待结果**。dataset.py 与 baseline 逐行对齐：头部截断 + 不丢尾批 + 静态 rg_list + prefetch_factor=1。 |
+> **成功！回归 baseline AUC 0.857。**
+> 修复清单：头部截断 + 不丢尾批 + 静态 rg_list + 移除 loss_mask。 |
 
 ---
 
