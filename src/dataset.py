@@ -342,10 +342,11 @@ class PCVRParquetDataset(IterableDataset):
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         worker_info = torch.utils.data.get_worker_info()
-        # File-level shuffle: copy and randomize Row Group order per epoch.
-        rg_list = list(self._rg_list)
-        if self.shuffle:
-            random.shuffle(rg_list)
+        # [DISABLED] Per-epoch row-group shuffle — removed to match baseline.
+        # rg_list = list(self._rg_list)
+        # if self.shuffle:
+        #     random.shuffle(rg_list)
+        rg_list = self._rg_list
         if worker_info is not None and worker_info.num_workers > 1:
             rg_list = [rg for i, rg in enumerate(rg_list)
                        if i % worker_info.num_workers == worker_info.id]
