@@ -120,11 +120,26 @@
 
 | Epoch | AUC (val) | AUC (test) | LogLoss | 备注 |
 |-------|-----------|------------|---------|------|
+| best | **0.769** | — | — | 比第一次 0.818 还差，更远离 baseline 0.857 |
+
+> **失败。AUC 0.769，反而更差。**
+> **二次根因分析**（opus 协助排查）：排除 log-spaced 采样后，仍有两处 silent 行为差异：
+> 1. `_flush_buffer` 尾批无条件丢弃 —— `overlap=0` 时 `break` 仍生效，每次 flush 最多丢 255 行，累积每 epoch ~5% 数据被截断
+> 2. `__iter__` 每 epoch 随机化 row-group 顺序 —— baseline 是静态 `rg_list`
+>
+> 修复：commit `64f9d67`（break 条件化）+ `68c7162`（shuffle 禁用）。
+
+---
+
+### 实际结果（Job: exp_b_zero_diff / 第三次提交，全部修复）
+
+| Epoch | AUC (val) | AUC (test) | LogLoss | 备注 |
+|-------|-----------|------------|---------|------|
 | 1 | | | | |
 | 2 | | | | |
 | best | | | | |
 
-> **等待结果**。当前代码与 baseline 源码级等价（纯 BCE，无 InfoNCE，无 scheduler，头部截断）。 |
+> **等待结果**。dataset.py 与 baseline 逐行对齐：头部截断 + 不丢尾批 + 静态 rg_list + prefetch_factor=1。 |
 
 ---
 
