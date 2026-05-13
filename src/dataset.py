@@ -377,9 +377,7 @@ class PCVRParquetDataset(IterableDataset):
         re-slice and yield batch-sized chunks.
 
         When ``overlap > 0``, a sliding window is used so that consecutive
-        batches share ``overlap`` rows.  The overlapped rows are tagged with
-        ``loss_mask=False`` so that downstream losses (BCE / Pair / Focal)
-        ignore them, while InfoNCE still sees the full batch.
+        batches share ``overlap`` rows.
         """
         merged: Dict[str, torch.Tensor] = {}
         non_tensor_keys: Dict[str, Any] = {}

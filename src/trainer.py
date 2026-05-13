@@ -539,12 +539,6 @@ class PCVRHyFormerRankingTrainer:
         device_batch = self._batch_to_device(batch)
         label = device_batch['label'].float()
 
-        # loss_mask: True for "new" rows, False for overlapped rows.
-        # Overlapped rows participate in InfoNCE but are excluded from
-        # BCE / Pair / Focal to avoid duplicate gradient signals.
-        # When overlap=0, loss_mask is all-True (identity).
-        loss_mask = device_batch.get('loss_mask', torch.ones_like(label, dtype=torch.bool))
-
         self.dense_optimizer.zero_grad()
         if self.sparse_optimizer is not None:
             self.sparse_optimizer.zero_grad()
@@ -558,31 +552,27 @@ class PCVRHyFormerRankingTrainer:
             logits = self.model(model_input)  # (B, 1)
         logits = logits.squeeze(-1)  # (B,)
 
-        # Masked logits/labels for losses that should ignore overlap rows.
-        valid_logits = logits[loss_mask]
-        valid_label = label[loss_mask]
-
         loss = torch.tensor(0.0, device=logits.device)
         loss_dict = {}
 
         if 'bce' in self.parsed_losses:
-            bce_loss = F.binary_cross_entropy_with_logits(valid_logits, valid_label)
+            bce_loss = F.binary_cross_entropy_with_logits(logits, label)
             loss = loss + self.bce_weight * bce_loss
             loss_dict['bce'] = bce_loss
 
         if 'focal' in self.parsed_losses:
             focal_loss = sigmoid_focal_loss(
-                valid_logits, valid_label, alpha=self.focal_alpha, gamma=self.focal_gamma
+                logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma
             )
             loss = loss + self.focal_weight * focal_loss
             loss_dict['focal'] = focal_loss
 
         if 'pair' in self.parsed_losses:
-            pos_mask = valid_label == 1
-            neg_mask = valid_label == 0
+            pos_mask = label == 1
+            neg_mask = label == 0
             if pos_mask.sum() > 0 and neg_mask.sum() > 0:
-                pos_logits = valid_logits[pos_mask]   # (N+,)
-                neg_logits = valid_logits[neg_mask]   # (N-,)
+                pos_logits = logits[pos_mask]   # (N+,)
+                neg_logits = logits[neg_mask]   # (N-,)
                 # Safe Pair Loss: repeat-sample the minority class so that
                 # we can construct a dense (N, N) difference matrix even when
                 # the batch is heavily imbalanced.
