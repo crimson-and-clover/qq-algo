@@ -403,15 +403,6 @@ class PCVRParquetDataset(IterableDataset):
                 break
             batch: Dict[str, Any] = {k: v[rand_idx[i:end]] for k, v in merged.items()}
             batch.update(non_tensor_keys)
-
-            # loss_mask: True for "new" rows, False for overlapped rows.
-            # The first batch in a flush buffer has no predecessor, so it is
-            # all-new.  Subsequent batches share their first ``overlap`` rows
-            # with the previous batch's tail.
-            loss_mask = torch.ones(self.batch_size, dtype=torch.bool)
-            if self.overlap > 0 and i > 0:
-                loss_mask[:self.overlap] = False
-            batch['loss_mask'] = loss_mask
             yield batch
         del merged
         buffer.clear()
