@@ -396,7 +396,9 @@ class PCVRParquetDataset(IterableDataset):
             end = min(i + self.batch_size, total_rows)
             # Skip the final truncated batch so that every yielded batch has
             # exactly ``batch_size`` rows (required by pre-allocated buffers).
-            if end - i < self.batch_size:
+            # Only enforced when overlap>0 (sliding window requires fixed size);
+            # overlap=0 path matches baseline behaviour (yield partial tail).
+            if self.overlap > 0 and end - i < self.batch_size:
                 break
             batch: Dict[str, Any] = {k: v[rand_idx[i:end]] for k, v in merged.items()}
             batch.update(non_tensor_keys)
