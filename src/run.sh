@@ -8,9 +8,9 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 # python3 -u "${SCRIPT_DIR}/data_explorer.py" \
 #     "$@"
 
-# ---- Experiment B: 纯 baseline 等价对照 ----
-# 仅保留绝对一致的修改：无 log-spaced 采样，无 InfoNCE，无 scheduler。
-# 确认是否能回到 baseline AUC 0.86。
+# ---- Experiment C: Focal Loss ----
+# 在 baseline 上只换 loss，不改模型结构。
+# 正负比 1:9，Focal Loss 自动降权简单负样本。
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
     --user_ns_tokens 5 \
@@ -20,7 +20,9 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \
     --no_scheduler \
-    --loss_type bce \
+    --loss_type focal \
+    --focal_alpha 0.75 \
+    --focal_gamma 2.0 \
     "$@"
 
 # ---- Legacy config: BCE + Pairwise Hinge ----
