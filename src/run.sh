@@ -8,9 +8,9 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 # python3 -u "${SCRIPT_DIR}/data_explorer.py" \
 #     "$@"
 
-# ---- Experiment C: Focal Loss ----
-# 在 baseline 上只换 loss，不改模型结构。
-# 正负比 1:9，Focal Loss 自动降权简单负样本。
+# ---- Experiment C4: BCE + InfoNCE uniformity + Scheduler ----
+# Focal Loss 梯度太小 (alpha=0.75→loss scale 1/13)，AUC 仅 0.80，放弃。
+# 合入两个已验证正向的改进：InfoNCE 防坍缩 + warmup-cosine 调度器。
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
     --user_ns_tokens 5 \
@@ -19,11 +19,26 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \
-    --no_scheduler \
-    --loss_type focal \
-    --focal_alpha 0.75 \
-    --focal_gamma 2.0 \
+    --loss_type bce+info \
+    --info_weight 0.05 \
+    --info_tau 0.15 \
+    --cosine_t_max_epochs 12 \
     "$@"
+
+# ---- Experiment C: Focal Loss (FAILED — AUC 0.80, baseline=0.857) ----
+# python3 -u "${SCRIPT_DIR}/train.py" \
+#     --ns_tokenizer_type rankmixer \
+#     --user_ns_tokens 5 \
+#     --item_ns_tokens 2 \
+#     --num_queries 2 \
+#     --ns_groups_json "" \
+#     --emb_skip_threshold 1000000 \
+#     --num_workers 8 \
+#     --no_scheduler \
+#     --loss_type focal \
+#     --focal_alpha 0.75 \
+#     --focal_gamma 2.0 \
+#     "$@"
 
 # ---- Legacy config: BCE + Pairwise Hinge ----
 # python3 -u "${SCRIPT_DIR}/train.py" \

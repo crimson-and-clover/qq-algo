@@ -1,7 +1,46 @@
 # 实验日志
 
 > 基线：`run.sh` 原始配置 (commit `d8ad263` 之前)
-> AUC 基线 = 0.86
+> AUC 基线 = 0.857 (实验 B 第3次)
+
+---
+
+## 5天冲 SOTA 路线图（目标 AUC ≥ 0.87）
+
+### 教训总结（来自 git 历史 + 实验 B 回归）
+
+| 教训 | 来源 | 对策 |
+|------|------|------|
+| **绝不丢弃训练数据** | `_flush_buffer` break 无条件丢尾批 → -5% 数据 | 已修复，后续不改 `_flush_buffer` |
+| **采样策略是 AUC 的第一大杠杆** | log-spaced vs 头部截断差 4 个点 | 单独拉回 log-spaced 采样（不改模型） |
+| **InfoNCE uniformity 被数据 bug 连坐了** | 数据丢弃时 val 还能 0.84，无 InfoNCE 时 val 只有 0.76 | 在干净 baseline 上重新验证 InfoNCE |
+| **一次只改一个变量** | `d8ad263` 混了采样/衰减/RoPE/interaction 全锅端 | 每个实验只动一个维度 |
+
+### 优先级排序（按预期收益/风险比）
+
+```
+Tier 1 ─ 高收益零风险（不改模型结构）
+  C:   Focal Loss           [已提交→失败 0.80]  放弃
+  C4:  BCE+InfoNCE+Scheduler [已编码]  预期 +0.3-1.0  (InfoNCE + warmup-cosine)
+
+Tier 2 ─ 数据覆盖（改采样不改模型）
+  D2:  log-spaced 采样      [待编码]  预期 +0.5-1.5  (P95=1969, 当前只用 13%)
+  D:   序列翻倍 256→512     [待编码]  预期 +0.3-0.8  (OOM 风险)
+
+Tier 3 ─ 模型增强（有风险）
+  E:   LongerEncoder        [待编码]  预期 +0.5-1.0  (结构变化)
+  E2:  RoPE                 [待编码]  预期 +0.2-0.5  (位置编码)
+```
+
+### 5天时间线
+
+| 天 | 提交 | 内容 | 积累 AUC |
+|----|------|------|----------|
+| 1 | ~~C (失败)~~ | Focal Loss → 0.80，放弃 | 0.857 |
+| 2 | C4 (已编码) | BCE + InfoNCE + Scheduler | 0.857 → ? |
+| 2-3 | D2 | log-spaced 采样（只捡 `d8ad263` 的采样逻辑，不带衰减/RoPE/interaction） | ? |
+| 3-4 | D | 序列翻倍 | ? |
+| 4-5 | E | LongerEncoder | ? |
 
 ---
 
@@ -142,27 +181,109 @@
 
 ---
 
-## 实验 C：Focal Loss（不改模型，只换 loss）
+## 实验 C：Focal Loss（不改模型，只换 loss）[已提交]
 
+**Job**: `exp_c_focal`
 **日期**：
 
 ### 修改
 
 ```bash
-# run.sh 改 1 行
---loss_type bce+info  →  --loss_type focal+info
+# run.sh：baseline BCE → Focal
+--loss_type bce    →    --loss_type focal --focal_alpha 0.75 --focal_gamma 2.0
+# 其余完全同 baseline：no_scheduler, no infoNCE, no target_attention
 ```
 
 ### 原理
 
-正负比 1:9，BCE 同等对待所有样本。Focal Loss 自动降权简单负样本（gamma=2），让模型专注困难样本。
+正负比 1:9，BCE 同等对待所有样本。Focal Loss (alpha=0.75, gamma=2) 自动降权简单负样本，让模型专注困难样本。
 
 ### 预期
 
 | 指标 | 实验 B | 预期实验 C |
 |------|--------|-----------|
-| AUC | B 的基线 | **+0.5–1.0** |
+| AUC | 0.857 | **0.862–0.867** |
 | LogLoss | — | 可能微涨（Focal 不直接优化 logloss） |
+
+### 实际结果
+
+| Epoch | AUC | 备注 |
+|-------|-----|------|
+| best | **0.80** | 远低于 baseline 0.857，失败 |
+
+> **失败。根因**：Focal Loss 在初始化时梯度量级仅为 BCE 的 1/13。
+> ```
+> alpha=0.75, gamma=2, p≈0.5:
+>   Focal/BCE = (0.1×0.75×0.25 + 0.9×0.25×0.25) × 0.693 / 0.693 = 0.052/0.693 ≈ 0.075
+> ```
+> 同 LR 下实际学习距离只有 BCE 的 1/13。调整 alpha/gamma 需多轮试错，5天时间成本太高。
+> **决策：放弃 Focal，直接推进 InfoNCE + Scheduler。**
+
+---
+
+## 实验 C4：BCE + InfoNCE uniformity + Scheduler [已编码]
+
+**Job**: `exp_c4_combo`
+**日期**：
+
+### 修改
+
+```bash
+# baseline BCE + InfoNCE uniformity + warmup-cosine scheduler
+--loss_type bce+info --info_weight 0.05 --info_tau 0.15
+# 删除 --no_scheduler，恢复默认 warmup=2ep + cosine=999ep（慢衰减）
+# 不改模型结构、不改采样策略
+```
+
+### 原理
+
+两个互不冲突的已验证改进合入：
+- **InfoNCE uniformity**（commit `2a009a6`）：logsumexp 推远 batch 内其他样本，防表征坍缩。在数据丢弃 bug 下 val 仍有 0.84（同期无 InfoNCE 仅 0.76）
+- **warmup + cosine**：warmup 防初期震荡，cosine 慢衰减防过拟合
+
+### 预期
+
+| 指标 | baseline (B) | 预期 C4 |
+|------|-------------|---------|
+| AUC | 0.857 | **0.86–0.87+** |
+| InfoNCE | — | 6–8 稳定 |
+
+### 实际结果
+
+| Epoch | AUC | LogLoss | InfoNCE | 备注 |
+|-------|-----|---------|---------|------|
+| 1 | | | | |
+| best | | | | |
+
+---
+
+## 实验 D2：log-spaced 序列采样（只捡采样，不带模型改动）[待编码]
+
+**Job**: `exp_d2_logspace`
+**日期**：
+
+### 修改
+
+从 commit `d8ad263` 只提取 `dataset.py` 中的 log-spaced 采样逻辑。**不引入**：时间衰减门控、RoPE、feature_interaction、cold restart、weight_decay。
+
+```python
+# dataset.py：头部截断 → log-spaced 采样
+# dense_k = max_len // 2   (前一半密集：位置 0..127)
+# sparse_k = max_len - dense_k  (后一半对数间隔：128..1968 均匀步长)
+# 短序列 (rl <= max_len)：全保留
+# 长序列：前半密集 + 后半等步长稀疏
+```
+
+### 原理
+
+P95 序列长度 = 1969，当前头部截断只用 256（13%）。log-spaced 在 256 窗口内覆盖头尾：前半 128 个步（最新行为）+ 后半 128 个对数间隔步（历史关键节点）。不改模型结构、不改 encoder、不改 loss。
+
+### 预期
+
+| 指标 | C4 基线 | 预期实验 D2 |
+|------|---------|-----------|
+| AUC | C4 的基线 | **+0.5–1.5** |
+| 序列覆盖率 | 13% | **~25%**（256 窗口内头尾兼顾） |
 
 ### 实际结果
 
@@ -173,30 +294,28 @@
 
 ---
 
-## 实验 D：LongerEncoder 单独加（无时间衰减）
+## 实验 D：序列翻倍（256→512，纯扩窗口）[待编码]
 
+**Job**: `exp_d_seq2x`
 **日期**：
 
 ### 修改
 
 ```bash
-# run.sh 加 3 行（在实验 C 基础上）
---seq_encoder_type longer \
---seq_top_k 256 \
---seq_max_lens seq_a:1024,seq_b:1024,seq_c:1024,seq_d:2048 \
+# 在最佳配置基础上
+--seq_max_lens seq_a:512,seq_b:512,seq_c:1024,seq_d:1024
 ```
 
 ### 原理
 
-模型结构回 baseline 后，序列截断又回到了 13% 利用率。LongerEncoder 的 top-K cross-attention 允许 4x 长序列而不 O(n²)。这次**不带时间衰减**，避免旧数据被压死。
+当前 256-512 仅用 13% 序列。翻倍到 512-1024 覆盖 ~25%。纯扩大窗口，不改采样策略。若 OOM 先降 seq_d 回 512。
 
 ### 预期
 
-| 指标 | 实验 C | 预期实验 D |
-|------|--------|-----------|
-| AUC | C 的基线 | **+1.0–2.0** |
-| 序列利用率 | 13% | **~60%** |
-| 显存 | — | +2x（若 OOM 先降 seq_d 到 1024） |
+| 指标 | 前步基线 | 预期 |
+|------|---------|------|
+| AUC | 前步基线 | **+0.3–0.8** |
+| 显存 | — | +1.5–2x |
 
 ### 实际结果
 
@@ -207,68 +326,63 @@
 
 ---
 
-## 实验 E：ns_groups.json + GroupNSTokenizer
+## 实验 E：LongerEncoder（结构升级）[待编码]
 
+**Job**: `exp_e_longer`
 **日期**：
 
 ### 修改
 
 ```bash
-# run.sh 改 2 行
---ns_tokenizer_type group \
---ns_groups_json "${SCRIPT_DIR}/ns_groups.json" \
---num_queries 1 \
+--seq_encoder_type longer --seq_top_k 256
+# 序列长度保持 D/D2 最优值
 ```
 
 ### 原理
 
-ns_groups.json 将 46 个 user fids 按语义分为 7 组（用户属性/行为/上下文）、14 个 item fids 分为 4 组（商品类型/质量/属性）。GroupNSTokenizer 每组投影到 1 个 token（共 12 个），比 RankMixer 的 5+2 个 token 信息损失更小，且保留了分组语义。
-
-注意：`num_queries` 需改为 1 满足 `d_model % T == 0`（T = 1*4 + 12 = 16）。
+LongerEncoder 的 top-K cross-attention 支持长序列而不 O(n²)。不改采样、不改 loss、不带时间衰减。
 
 ### 预期
 
-| 指标 | 实验 D | 预期实验 E |
-|------|--------|-----------|
-| AUC | D 的基线 | **±0.5**（不确定方向） |
+| 指标 | 前步基线 | 预期 |
+|------|---------|------|
+| AUC | 前步基线 | **+0.5–1.0** |
 
 ### 实际结果
 
-| Epoch | AUC | 备注 |
-|-------|-----|------|
-| 1 | | |
-| best | | |
+| Epoch | AUC | LogLoss | 备注 |
+|-------|-----|---------|------|
+| 1 | | | |
+| best | | | |
 
 ---
 
-## 实验 F：RankMixer 压缩比降低
+## 实验 E2：RoPE 位置编码 [待编码]
 
+**Job**: `exp_e2_rope`
 **日期**：
 
 ### 修改
 
 ```bash
-# 在实验 D 基础上，保持 rankmixer 但提高 token 数
---user_ns_tokens 8 \
---item_ns_tokens 4 \
+--use_rope true
 ```
 
 ### 原理
 
-当前 RankMixer 把 46 user fids + 1 dense = 47 个 embedding 压缩到 5 个 token，压缩比 9:1。加大到 8+4=12 token 后压缩比降到 ~4:1，信息损失减小。需要验证 `d_model % T == 0`（T = num_queries*4 + 8+1+4+0，实际值依 num_queries 而定）。
+RoPE 提供相对位置编码，对长序列建模有帮助。从 `d8ad263` 单独提取。
 
 ### 预期
 
-| 指标 | 实验 D | 预期实验 F |
-|------|--------|-----------|
-| AUC | D 的基线 | **+0.3–0.5** |
+| 指标 | 前步基线 | 预期 |
+|------|---------|------|
+| AUC | 前步基线 | **+0.2–0.5** |
 
-### 实际结果
+---
 
-| Epoch | AUC | 备注 |
-|-------|-----|------|
-| 1 | | |
-| best | | |
+## 实验 F1/F2（低优先级，视时间）：ns_groups / RankMixer 压缩比
+
+搁置到 Tier 3 之后，优先级低。
 
 ---
 

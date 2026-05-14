@@ -329,8 +329,9 @@ def supervised_infonce(
     sim = torch.matmul(emb, emb.t()) / tau
 
     if mode == 'uniformity':
-        # Self is the only positive → loss = logsumexp(sim_j) − 1/τ.
-        # The −1/τ term is gradient-free, so we minimise logsumexp directly.
+        # Mask self-similarity so that the logsumexp denominator only
+        # includes *other* samples (the negatives we want to push away).
+        sim = sim.masked_fill(torch.eye(B, device=emb.device).bool(), float('-inf'))
         loss = torch.logsumexp(sim, dim=1).mean()
     else:
         sim = sim.masked_fill(torch.eye(B, device=emb.device).bool(), -1e9)
